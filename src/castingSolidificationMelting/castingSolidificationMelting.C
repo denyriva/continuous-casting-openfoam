@@ -35,6 +35,7 @@ License
 #include "addToRunTimeSelectionTable.H"
 #include "geometricOneField.H"
 #include "surfaceFields.H"
+#include "PstreamReduceOps.H"
 
 // * * * * * * * * * * * * * Static Member Functions * * * * * * * * * * * * //
 
@@ -157,7 +158,18 @@ void Foam::fv::castingSolidificationMelting::readCoeffs(const dictionary& dict)
             << "equilibrium enabled" << endl;
     }
 
+    TRef_ = dict.lookup<scalar>("TRef");
     beta_ = dict.lookup<scalar>("beta");
+    betaC_ = dict.lookupOrDefault<scalar>("betaC", 0.0);
+
+    if (mag(betaC_) > SMALL && !compositionDependentLiquidus_)
+    {
+        FatalIOErrorInFunction(dict)
+            << "Solutal buoyancy requires "
+            << "compositionDependentLiquidus = true because the "
+            << "buoyancy source uses the liquid composition CarbonL."
+            << exit(FatalIOError);
+    }
 
     if (mode_ == thermoMode::lookup)
     {
@@ -486,7 +498,9 @@ Foam::fv::castingSolidificationMelting::castingSolidificationMelting
     Cu_(NaN),
     q_(NaN),
     pullVelocity_(vector::zero),
+    TRef_(NaN),
     beta_(NaN),
+    betaC_(0.0),
     alpha1_
     (
         IOobject
@@ -610,6 +624,9 @@ void Foam::fv::castingSolidificationMelting::addSup
 
     update(Cp);
 
+    const volScalarField& T =
+        mesh().lookupObject<volScalarField>(TName_);
+
     const vector g = this->g();
 
     scalarField& Sp = eqn.diag();
@@ -617,6 +634,22 @@ void Foam::fv::castingSolidificationMelting::addSup
     const scalarField& V = mesh().V();
 
     const labelList& cells = zone_.zone();
+
+    // Gate 5B thermo-solutal buoyancy diagnostics
+    scalar maxSbThermal = 0.0;
+    scalar maxSbSolutal = 0.0;
+
+    scalar integralSbThermal = 0.0;
+    scalar integralSbSolutal = 0.0;
+
+    vector netSbThermal = vector::zero;
+    vector netSbSolutal = vector::zero;
+
+    scalar minDeltaTemperature = GREAT;
+    scalar maxDeltaTemperature = -GREAT;
+
+    scalar minDeltaCarbon = GREAT;
+    scalar maxDeltaCarbon = -GREAT;
 
     forAll(cells, i)
     {
@@ -626,11 +659,109 @@ void Foam::fv::castingSolidificationMelting::addSup
         const scalar alpha1c = alpha1_[celli];
 
         const scalar S = -Cu_*sqr(1.0 - alpha1c)/(pow3(alpha1c) + q_);
-        const vector Sb = rhoRef_*g*beta_*deltaT_[i];
+
+        const scalar deltaTemperature =
+            T[celli] - TRef_;
+
+        const scalar deltaCarbon =
+            compositionDependentLiquidus_
+        ? CarbonL_[celli] - CarbonRef_
+        : 0.0;
+
+        const vector SbThermal =
+            -rhoRef_*g*beta_*deltaTemperature;
+
+        const vector SbSolutal =
+            -rhoRef_*g*betaC_*deltaCarbon;
+
+        const vector Sb =
+            SbThermal + SbSolutal;
+
+        // Accumulate local diagnostics
+        maxSbThermal =
+            max(maxSbThermal, mag(SbThermal));
+
+        maxSbSolutal =
+            max(maxSbSolutal, mag(SbSolutal));
+
+        integralSbThermal +=
+            Vc*mag(SbThermal);
+
+        integralSbSolutal +=
+            Vc*mag(SbSolutal);
+
+        netSbThermal +=
+            Vc*SbThermal;
+
+        netSbSolutal +=
+            Vc*SbSolutal;
+
+        minDeltaTemperature =
+            min(minDeltaTemperature, deltaTemperature);
+
+        maxDeltaTemperature =
+            max(maxDeltaTemperature, deltaTemperature);
+
+        minDeltaCarbon =
+            min(minDeltaCarbon, deltaCarbon);
+
+        maxDeltaCarbon =
+            max(maxDeltaCarbon, deltaCarbon);
 
         Sp[celli] += Vc*S;
         Su[celli] += Vc*(Sb + S*pullVelocity_);
     }
+
+    // Global reductions for serial/parallel runs
+    maxSbThermal =
+        returnReduce(maxSbThermal, maxOp<scalar>());
+
+    maxSbSolutal =
+        returnReduce(maxSbSolutal, maxOp<scalar>());
+
+    integralSbThermal =
+        returnReduce(integralSbThermal, sumOp<scalar>());
+
+    integralSbSolutal =
+        returnReduce(integralSbSolutal, sumOp<scalar>());
+
+    netSbThermal =
+        returnReduce(netSbThermal, sumOp<vector>());
+
+    netSbSolutal =
+        returnReduce(netSbSolutal, sumOp<vector>());
+
+    minDeltaTemperature =
+        returnReduce(minDeltaTemperature, minOp<scalar>());
+
+    maxDeltaTemperature =
+        returnReduce(maxDeltaTemperature, maxOp<scalar>());
+
+    minDeltaCarbon =
+        returnReduce(minDeltaCarbon, minOp<scalar>());
+
+    maxDeltaCarbon =
+        returnReduce(maxDeltaCarbon, maxOp<scalar>());
+
+    Info<< "Thermo-solutal buoyancy diagnostics" << nl
+        << "    deltaTemperature min/max = "
+        << minDeltaTemperature << " "
+        << maxDeltaTemperature << " K" << nl
+        << "    deltaCarbon min/max      = "
+        << minDeltaCarbon << " " << maxDeltaCarbon << nl
+        << "    max(|Fb,T|)             = "
+        << maxSbThermal << " N/m3" << nl
+        << "    max(|Fb,C|)             = "
+        << maxSbSolutal << " N/m3" << nl
+        << "    integral(|Fb,T| dV)     = "
+        << integralSbThermal << " N" << nl
+        << "    integral(|Fb,C| dV)     = "
+        << integralSbSolutal << " N" << nl
+        << "    net thermal force       = "
+        << netSbThermal << " N" << nl
+        << "    net solutal force       = "
+        << netSbSolutal << " N"
+        << endl;
 }
 
 

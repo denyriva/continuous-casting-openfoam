@@ -226,8 +226,14 @@ private:
         //- Velocity imposed on the solid phase [m/s]
         vector pullVelocity_;
 
+        //- Reference temperature for thermal buoyancy [K]
+        scalar TRef_;
+
         //- Thermal expansion coefficient [1/K]
         scalar beta_;
+
+        //- Solutal expansion coefficient [per unit carbon mass fraction]
+        scalar betaC_;
 
         //- Reference heat capacity for thermoMode::lookup
         scalar CpRef_;
