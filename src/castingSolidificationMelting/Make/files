@@ -1,0 +1,3 @@
+castingSolidificationMelting.C
+
+LIB = $(FOAM_USER_LIBBIN)/libcastingSolidificationMelting

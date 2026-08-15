@@ -1,0 +1,29 @@
+# OpenFOAM compilation
+lnInclude/
+Make/linux*/
+**/Make/linux*/
+platforms/
+*.so
+*.o
+*.dep
+
+# OpenFOAM case output
+processor*/
+postProcessing/
+VTK/
+
+# Common generated files
+log.*
+*.log
+*.foam
+core
+
+# Editor/system
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*~
+*.bak
+*.swp
