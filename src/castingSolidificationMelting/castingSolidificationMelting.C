@@ -651,6 +651,33 @@ void Foam::fv::castingSolidificationMelting::addSup
     scalar minDeltaCarbon = GREAT;
     scalar maxDeltaCarbon = -GREAT;
 
+    // Gate 5B mushy-zone audit.
+    // Regions:
+    //   0: solid-like  alpha1 < 0.1
+    //   1: mushy       0.1 <= alpha1 <= 0.9
+    //   2: liquid-like alpha1 > 0.9
+    label regionCells[3] = {0, 0, 0};
+
+    scalar regionVolume[3] = {0.0, 0.0, 0.0};
+
+    scalar regionMinCarbonL[3] = {GREAT, GREAT, GREAT};
+    scalar regionMaxCarbonL[3] = {-GREAT, -GREAT, -GREAT};
+
+    scalar regionMaxSbSolutal[3] = {0.0, 0.0, 0.0};
+    scalar regionIntegralSbSolutal[3] = {0.0, 0.0, 0.0};
+
+    scalar regionMaxRelativeU[3] = {0.0, 0.0, 0.0};
+
+    scalar regionNetSolutalPower[3] = {0.0, 0.0, 0.0};
+    scalar regionAbsSolutalPower[3] = {0.0, 0.0, 0.0};
+
+    // Exact peak-location diagnostic for serial runs.
+    scalar localPeakSbSolutal = -GREAT;
+    label localPeakCell = -1;
+    scalar localPeakAlpha1 = -1.0;
+    scalar localPeakCarbonL = 0.0;
+    vector localPeakPosition = vector::zero;
+
     forAll(cells, i)
     {
         const label celli = cells[i];
@@ -672,7 +699,7 @@ void Foam::fv::castingSolidificationMelting::addSup
             -rhoRef_*g*beta_*deltaTemperature;
 
         const vector SbSolutal =
-            -rhoRef_*g*betaC_*deltaCarbon;
+            -alpha1c*rhoRef_*g*betaC_*deltaCarbon;
 
         const vector Sb =
             SbThermal + SbSolutal;
@@ -707,6 +734,57 @@ void Foam::fv::castingSolidificationMelting::addSup
 
         maxDeltaCarbon =
             max(maxDeltaCarbon, deltaCarbon);
+
+        // Alpha-resolved solutal-force audit
+        label regioni = 1;
+
+        if (alpha1c < 0.1)
+        {
+            regioni = 0;
+        }
+        else if (alpha1c > 0.9)
+        {
+            regioni = 2;
+        }
+
+        const scalar CarbonLc = CarbonL_[celli];
+        const scalar magSbSolutalc = mag(SbSolutal);
+        const vector relativeU = U[celli] - pullVelocity_;
+        const scalar magRelativeU = mag(relativeU);
+        const scalar solutalPowerDensity = SbSolutal & relativeU;
+
+        regionCells[regioni] += 1;
+        regionVolume[regioni] += Vc;
+
+        regionMinCarbonL[regioni] =
+            min(regionMinCarbonL[regioni], CarbonLc);
+
+        regionMaxCarbonL[regioni] =
+            max(regionMaxCarbonL[regioni], CarbonLc);
+
+        regionMaxSbSolutal[regioni] =
+            max(regionMaxSbSolutal[regioni], magSbSolutalc);
+
+        regionIntegralSbSolutal[regioni] +=
+            Vc*magSbSolutalc;
+
+        regionMaxRelativeU[regioni] =
+            max(regionMaxRelativeU[regioni], magRelativeU);
+
+        regionNetSolutalPower[regioni] +=
+            Vc*solutalPowerDensity;
+
+        regionAbsSolutalPower[regioni] +=
+            Vc*mag(solutalPowerDensity);
+
+        if (magSbSolutalc > localPeakSbSolutal)
+        {
+            localPeakSbSolutal = magSbSolutalc;
+            localPeakCell = celli;
+            localPeakAlpha1 = alpha1c;
+            localPeakCarbonL = CarbonLc;
+            localPeakPosition = mesh().C()[celli];
+        }
 
         Sp[celli] += Vc*S;
         Su[celli] += Vc*(Sb + S*pullVelocity_);
@@ -743,6 +821,48 @@ void Foam::fv::castingSolidificationMelting::addSup
     maxDeltaCarbon =
         returnReduce(maxDeltaCarbon, maxOp<scalar>());
 
+    for (label regioni = 0; regioni < 3; ++regioni)
+    {
+        regionCells[regioni] =
+            returnReduce(regionCells[regioni], sumOp<label>());
+
+        regionVolume[regioni] =
+            returnReduce(regionVolume[regioni], sumOp<scalar>());
+
+        regionMinCarbonL[regioni] =
+            returnReduce(regionMinCarbonL[regioni], minOp<scalar>());
+
+        regionMaxCarbonL[regioni] =
+            returnReduce(regionMaxCarbonL[regioni], maxOp<scalar>());
+
+        regionMaxSbSolutal[regioni] =
+            returnReduce(regionMaxSbSolutal[regioni], maxOp<scalar>());
+
+        regionIntegralSbSolutal[regioni] =
+            returnReduce
+            (
+                regionIntegralSbSolutal[regioni],
+                sumOp<scalar>()
+            );
+
+        regionMaxRelativeU[regioni] =
+            returnReduce(regionMaxRelativeU[regioni], maxOp<scalar>());
+
+        regionNetSolutalPower[regioni] =
+            returnReduce
+            (
+                regionNetSolutalPower[regioni],
+                sumOp<scalar>()
+            );
+
+        regionAbsSolutalPower[regioni] =
+            returnReduce
+            (
+                regionAbsSolutalPower[regioni],
+                sumOp<scalar>()
+            );
+    }
+
     Info<< "Thermo-solutal buoyancy diagnostics" << nl
         << "    deltaTemperature min/max = "
         << minDeltaTemperature << " "
@@ -762,6 +882,61 @@ void Foam::fv::castingSolidificationMelting::addSup
         << "    net solutal force       = "
         << netSbSolutal << " N"
         << endl;
+
+    Info<< "Alpha-resolved solutal buoyancy audit" << nl;
+
+    static const char* regionNames[3] =
+    {
+        "solid-like (alpha1 < 0.1)",
+        "mushy (0.1 <= alpha1 <= 0.9)",
+        "liquid-like (alpha1 > 0.9)"
+    };
+
+    for (label regioni = 0; regioni < 3; ++regioni)
+    {
+        Info<< "    " << regionNames[regioni] << nl
+            << "        cells                    = "
+            << regionCells[regioni] << nl
+            << "        volume                   = "
+            << regionVolume[regioni] << " m3" << nl;
+
+        if (regionCells[regioni] > 0)
+        {
+            Info<< "        CarbonL min/max          = "
+                << regionMinCarbonL[regioni] << " "
+                << regionMaxCarbonL[regioni] << nl
+                << "        max(|Fb,C|)              = "
+                << regionMaxSbSolutal[regioni] << " N/m3" << nl
+                << "        integral(|Fb,C| dV)      = "
+                << regionIntegralSbSolutal[regioni] << " N" << nl
+                << "        max(|U-Upull|)           = "
+                << regionMaxRelativeU[regioni] << " m/s" << nl
+                << "        integral(Fb,C.(U-Upull)) = "
+                << regionNetSolutalPower[regioni] << " W" << nl
+                << "        integral(|Fb,C.(U-Upull)|) = "
+                << regionAbsSolutalPower[regioni] << " W" << nl;
+        }
+        else
+        {
+            Info<< "        region is empty" << nl;
+        }
+    }
+
+    if (!Pstream::parRun() && localPeakCell >= 0)
+    {
+        Info<< "    peak solutal-force cell (serial)" << nl
+            << "        cell                      = "
+            << localPeakCell << nl
+            << "        position                  = "
+            << localPeakPosition << nl
+            << "        alpha1                    = "
+            << localPeakAlpha1 << nl
+            << "        CarbonL                   = "
+            << localPeakCarbonL << nl
+            << "        |Fb,C|                    = "
+            << localPeakSbSolutal << " N/m3"
+            << endl;
+    }
 }
 
 
