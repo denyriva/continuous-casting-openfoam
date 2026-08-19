@@ -1,0 +1,7 @@
+setRDeltaT.C
+moveMesh.C
+momentumPredictor.C
+correctPressure.C
+binaryAlloyMacrosegregation.C
+
+LIB = $(FOAM_USER_LIBBIN)/libbinaryAlloyMacrosegregationSolver

@@ -1,0 +1,50 @@
+flowchart TD
+
+    A["Start physical time step n → n+1<br/>Known fields from previous converged step:<br/>Uⁿ, pⁿ, Tⁿ, Cⁿ, fsⁿ, Clⁿ, Csⁿ"]
+
+    %% =========================
+    %% MOMENTUM
+    %% =========================
+
+    A --> B["Update thermo-solutal buoyancy<br/><br/>aT = -g βT (T - Tref)<br/>aC = -g βC (Cl - C0)<br/><br/><b>EXPLICIT</b><br/>uses currently available T and Cl"]
+
+    B --> C["Update BKC resistance<br/><br/>K⁻¹ = K0⁻¹ fsB²/(1-fsB)³<br/>Sdrag = νl K⁻¹<br/><br/><b>EXPLICIT coefficient</b><br/>computed from current fs"]
+
+    C --> D["Solve momentum equation for U<br/><br/>ddt(U) + div(phi,U) + viscous<br/>+ Sp(Sdrag,U)<br/>= -grad(p) + buoyancy<br/><br/><b>IMPLICIT:</b> U, BKC drag<br/><b>EXPLICIT:</b> buoyancy"]
+
+    %% =========================
+    %% NONLINEAR T-C-fs LOOP
+    %% =========================
+
+    D --> E["Begin solidification coupling loop<br/>corr = 1 ... 5"]
+
+    E --> F["Freeze current phase-dependent coefficients<br/><br/>CpMix(fs)<br/>kEff(fs)<br/>dfsdT(fs,T,C)<br/><br/><b>EXPLICIT / LAGGED COEFFICIENTS</b>"]
+
+    F --> G["Solve energy equation for T<br/><br/>ddt(CpMix,T)<br/>+ latent apparent-capacity term<br/>+ div(phi CpMix,T)<br/>- laplacian(kEff/rho,T) = 0<br/><br/><b>IMPLICIT:</b> T<br/><b>IMPLICIT:</b> latent Sp term in T<br/><b>EXPLICIT/FROZEN:</b> CpMix, kEff, dfsdT"]
+
+    G --> H["Update Lever equilibrium<br/><br/>Tliq(C)<br/>Tsol(C)<br/>fs(T,C)<br/>Cl(C,fs)<br/>Cs = kp Cl<br/>CpMix(fs)<br/>kEff(fs)<br/>dfsdT<br/><br/><b>EXPLICIT ALGEBRAIC UPDATE</b>"]
+
+    H --> I["Freeze species coefficients<br/><br/>Dmix = fs Ds + (1-fs) Dl<br/>q = Cl/C = 1/[1+fs(kp-1)]<br/><br/><b>EXPLICIT / LAGGED COEFFICIENTS</b>"]
+
+    I --> J["Solve mixture species equation for C<br/><br/>ddt(C)<br/>+ div(phi q,C)<br/>- laplacian(Dmix,C)<br/>= phase-difference diffusion corrections<br/><br/><b>IMPLICIT:</b> C storage<br/><b>IMPLICIT:</b> qC advection<br/><b>IMPLICIT:</b> mixture diffusion<br/><b>EXPLICIT:</b> phase-difference diffusion RHS"]
+
+    J --> K["Recalculate Lever equilibrium<br/><br/>C changed → Tliq/Tsol change<br/>→ fs, Cl, Cs change<br/>→ CpMix, kEff, dfsdT change<br/><br/><b>EXPLICIT ALGEBRAIC UPDATE</b>"]
+
+    K --> L{"corr < 5?"}
+
+    L -- Yes --> F
+    L -- No --> M["Final coupled T-C-phase state<br/>for this physical timestep"]
+
+    %% =========================
+    %% PRESSURE CORRECTION
+    %% =========================
+
+    M --> N["PISO pressure correction 1<br/><br/>Solve pressure equation<br/>correct phi and U<br/><br/><b>IMPLICIT pressure solve</b>"]
+
+    N --> O["PISO pressure correction 2<br/><br/>Solve pressure equation<br/>correct phi and U<br/><br/><b>IMPLICIT pressure solve</b>"]
+
+    O --> P["Post-solve diagnostics<br/><br/>BKC drag fields<br/>species diagnostics<br/>solute inventory<br/>macrosegregation"]
+
+    P --> Q["Advance to next physical timestep"]
+
+    Q --> A
