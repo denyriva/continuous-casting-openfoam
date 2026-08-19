@@ -1,649 +1,763 @@
-# Continuous Casting in OpenFOAM
+# Continuous Casting OpenFOAM — Binary Alloy Macrosegregation Solver
 
-Custom OpenFOAM Foundation v14 extensions for continuous casting with solidification, strand withdrawal, macrosegregation, composition-dependent phase equilibrium, and prescribed electromagnetic stirring (EMS).
+This repository contains a custom OpenFOAM Foundation v14 solver module for binary-alloy solidification and macrosegregation. The current main implementation is the `binaryAlloyMacrosegregation` solver, developed and validated against the standard BKC formulation used in the AFRODITE Sn–3 wt% Pb benchmark described by Moeinirad & Amani.
 
-This repository contains the custom source code developed for a staged validation project whose objective is to build an OpenFOAM continuous-casting model with capabilities approaching those normally available in commercial CFD packages, while keeping each added physical mechanism independently testable.
-
-> **Current status:** Gate 5A completed and frozen as tag `gate5a-complete`.  
-> Development of solutal buoyancy is being carried out on branch `gate5b-solutal-buoyancy`.
+The older `castingSolidificationMelting`-based implementation is retained in the repository as a legacy development path and should be treated separately from the validated BKC solver.
 
 ---
 
-## 1. Scope
+## Current validated model
 
-The model currently includes:
-
-- incompressible melt flow;
-- thermal buoyancy using a Boussinesq approximation;
-- SST k-omega turbulence where required by the case;
-- enthalpy-porosity solidification;
-- mushy-zone momentum damping;
-- latent heat;
-- prescribed strand withdrawal / casting velocity;
-- conservative treatment of latent-energy transport in the stationary casting domain;
-- transport of a mixture carbon field;
-- liquid/solid carbon partitioning;
-- reconstruction of `CarbonL` and `CarbonS`;
-- composition-dependent liquidus temperature;
-- composition-dependent liquid fraction;
-- macrosegregation caused by advection and solidification;
-- optional prescribed Lorentz-force EMS source.
-
-The present alloy implementation is a **binary Fe-C-style model** using carbon as the transported solute.
-
----
-
-## 2. Repository structure
+The validated solver is located at:
 
 ```text
-continuous-casting-openfoam/
-├── README.md
-├── .gitignore
-└── src/
-    ├── castingSolidificationMelting/
-    │   ├── castingSolidificationMelting.C
-    │   ├── castingSolidificationMelting.H
-    │   └── Make/
-    │       ├── files
-    │       └── options
-    │
-    └── macrosegregationTransport/
-        ├── macrosegregationTransport.C
-        ├── macrosegregationTransport.H
-        └── Make/
-            ├── files
-            └── options
+applications/modules/binaryAlloyMacrosegregation/
 ```
 
-Compiled objects and platform-specific `wmake` output are intentionally excluded from version control.
+Runtime solver name:
+
+```text
+binaryAlloyMacrosegregation
+```
+
+The validated development milestone is tagged:
+
+```text
+afrodite-bkc-validated
+```
+
+The solver reproduces the principal ingredients of the standard BKC benchmark formulation:
+
+- incompressible laminar flow;
+- thermal and solutal buoyancy;
+- lever-rule phase equilibrium;
+- Darcy resistance in the mushy zone using a secondary dendrite arm spacing;
+- phase-weighted heat capacity and thermal conductivity;
+- latent heat treatment consistent with the benchmark energy equation;
+- binary-alloy species transport with phase partitioning;
+- five nonlinear solidification corrections per time step;
+- macrosegregation diagnostics;
+- discrete energy-balance diagnostics.
+
+The AFRODITE benchmark was used as the principal validation case before considering continuous-casting-specific extensions such as prescribed solid withdrawal velocity.
 
 ---
 
-## 3. OpenFOAM version
+## Repository structure
 
-Development and validation have been performed using:
+```text
+.
+├── applications/
+│   └── modules/
+│       └── binaryAlloyMacrosegregation/
+│           ├── Make/
+│           │   ├── files
+│           │   └── options
+│           ├── binaryAlloyMacrosegregation.C
+│           ├── binaryAlloyMacrosegregation.H
+│           ├── correctPressure.C
+│           ├── momentumPredictor.C
+│           ├── moveMesh.C
+│           ├── setRDeltaT.C
+│           └── logic.mmd
+├── src/
+│   └── ...
+└── README.md
+```
 
-- **OpenFOAM Foundation v14**
-- Ubuntu 24.04 under WSL
-- GCC toolchain supplied with the OpenFOAM environment
+The `src/` tree contains the earlier fvModel-based continuous-casting implementation. It is preserved for reference and later reconciliation with the benchmarked solver, but it is not the implementation used for the AFRODITE BKC validation.
 
-The code should therefore be considered written specifically against the **Foundation v14 API** unless adapted for another release.
+---
 
-Before compiling, load the OpenFOAM environment in the usual way and verify:
+## OpenFOAM version
+
+The solver was developed for:
+
+```text
+OpenFOAM Foundation v14
+```
+
+The development environment used WSL Ubuntu with the Foundation distribution of OpenFOAM.
+
+The module is intended for execution through `foamRun`.
+
+---
+
+## Building the solver
+
+From the solver-module directory:
 
 ```bash
-foamVersion
+cd ~/OpenFOAM/$USER-14/projects/openfoam-continuous-casting/applications/modules/binaryAlloyMacrosegregation
+wmake libso .
 ```
 
----
-
-# 4. Custom models
-
-## 4.1 `castingSolidificationMelting`
-
-`castingSolidificationMelting` is a custom `fvModel` derived from the concepts used by the Foundation `solidificationMelting` model and extended for continuous casting.
-
-Its main responsibilities are:
-
-1. determining liquid fraction;
-2. applying mushy-zone resistance;
-3. accounting for latent heat;
-4. applying thermal buoyancy;
-5. representing strand withdrawal;
-6. supporting composition-dependent liquidus behavior;
-7. exposing fields required by the macrosegregation model.
-
-Important generated or maintained fields include:
+The resulting library is written to the user's OpenFOAM library directory, typically:
 
 ```text
-solidificationMelting1:alpha1
-Teq
-CarbonL
-CarbonS
+$FOAM_USER_LIBBIN/libbinaryAlloyMacrosegregationSolver.so
 ```
 
-where:
-
-- `alpha1` is the liquid fraction;
-- `Teq` is the local composition-dependent equilibrium temperature used by the model;
-- `CarbonL` is liquid-phase carbon concentration;
-- `CarbonS` is solid-phase carbon concentration.
-
-### Casting velocity
-
-The strand withdrawal velocity is prescribed through the project casting-kinematics configuration and used consistently by the solidification and macrosegregation models.
-
-The model does **not** physically translate the mesh. Instead, casting motion is represented in the governing equations.
-
-### Conservative latent-energy treatment
-
-The casting version uses a conservative latent contribution of the form
-
-```text
--L [ d(rho*alpha)/dt + div(phi*alpha_f) ]
-```
-
-so that latent energy is treated consistently when solidifying material is advected through a stationary computational domain.
-
-This is one of the main differences between this model and a simple stationary melting/solidification formulation.
-
----
-
-## 4.2 `macrosegregationTransport`
-
-`macrosegregationTransport` solves the transported mixture carbon field:
-
-```text
-Carbon
-```
-
-The project deliberately does **not** use the field name `C`, because OpenFOAM commonly uses `C` for cell-centre information.
-
-The phase concentrations are reconstructed as:
-
-```text
-CarbonL
-CarbonS
-```
-
-using the liquid fraction and the partition coefficient.
-
-For a local liquid fraction `fl` and partition coefficient `kp`,
-
-```text
-CarbonS = kp * CarbonL
-```
-
-and the conserved mixture concentration satisfies
-
-```text
-Carbon = fl*CarbonL + (1 - fl)*CarbonS
-```
-
-therefore
-
-```text
-CarbonL = Carbon / [fl + kp*(1 - fl)]
-```
-
-The present formulation is therefore closest to a **local-equilibrium / Lever-rule limit** for phase partitioning.
-
----
-
-# 5. Composition-dependent phase equilibrium
-
-Gate 5A introduced two-way coupling between composition and solidification.
-
-Previously the model effectively followed:
-
-```text
-temperature
-    ↓
-liquid fraction
-```
-
-while carbon was transported alongside the thermal solution.
-
-The present model contains the additional path:
-
-```text
-Carbon
-  ↓
-CarbonL
-  ↓
-composition-dependent liquidus temperature
-  ↓
-liquid fraction
-```
-
-This closes an important macrosegregation feedback loop:
-
-```text
-Carbon
-  ↓
-CarbonL
-  ↓
-Tliq(CarbonL)
-  ↓
-liquid fraction
-  ↓
-mushy resistance / flow
-  ↓
-Carbon transport
-```
-
-The liquidus relationship currently uses a configurable linearized slope:
-
-```text
-Tliq = TliqRef + liquidusSlope*(CarbonL - CarbonRef)
-```
-
-For validation, deliberately exaggerated slopes may be used to make the coupling easy to verify. Production values should be based on appropriate alloy thermodynamic data.
-
----
-
-# 6. Alloy-property configuration
-
-The validation development uses a common alloy-property dictionary to avoid duplicating composition-dependent constants across different OpenFOAM dictionaries.
-
-A representative configuration is:
-
-```text
-CarbonRef              0.01;
-partitionCoefficient   0.25;
-
-TsolRef                1593.15;
-TliqRef                1688.15;
-
-liquidusSlope          -1000;
-```
-
-The numerical values above are examples from validation work and **must not automatically be interpreted as production thermodynamic data**.
-
-In particular, validation cases may intentionally use artificial parameter values so that coupling mechanisms produce clearly observable responses.
-
----
-
-# 7. Building the libraries
-
-The Git repository is now the authoritative source tree.
-
-Do not edit older copies of the custom libraries elsewhere in the OpenFOAM directory tree.
-
-## `castingSolidificationMelting`
+Check that it exists with:
 
 ```bash
-cd ~/OpenFOAM/denyr-14/projects/openfoam-continuous-casting/src/castingSolidificationMelting
-wmake libso
-```
-
-## `macrosegregationTransport`
-
-```bash
-cd ~/OpenFOAM/denyr-14/projects/openfoam-continuous-casting/src/macrosegregationTransport
-wmake libso
-```
-
-The resulting shared libraries are written to the normal OpenFOAM user-library location, typically:
-
-```bash
-$FOAM_USER_LIBBIN
-```
-
-Check with:
-
-```bash
-echo $FOAM_USER_LIBBIN
-```
-
-and verify the libraries exist:
-
-```bash
-ls $FOAM_USER_LIBBIN | grep -E 'castingSolidificationMelting|macrosegregationTransport'
-```
-
-Expected library names are of the form:
-
-```text
-libcastingSolidificationMelting.so
-libmacrosegregationTransport.so
+ls -l $FOAM_USER_LIBBIN/libbinaryAlloyMacrosegregationSolver.so
 ```
 
 ---
 
-# 8. Loading the libraries in a case
+## Running a case
 
-A case using the custom models must load the required libraries in `system/controlDict`, for example:
+A case using the solver should load the custom library and select the runtime solver.
 
-```text
-libs
-(
-    "libcastingSolidificationMelting.so"
-    "libmacrosegregationTransport.so"
-);
+Typical execution:
+
+```bash
+foamRun
 ```
 
-Exact usage depends on the validation or production case.
+Parallel execution:
 
----
-
-# 9. Carbon field convention
-
-The conserved composition field is:
-
-```text
-Carbon
+```bash
+decomposePar
+mpirun -np <N> foamRun -parallel
 ```
 
-A typical initial field is therefore placed in:
+For example:
+
+```bash
+mpirun -np 12 foamRun -parallel > log.foamRun
+```
+
+The case must provide the usual incompressible-flow fields together with temperature and alloy composition.
+
+Typical primary fields:
 
 ```text
+0/U
+0/p
+0/T
 0/Carbon
 ```
 
-with an internal field such as:
+The solver additionally creates and writes derived alloy fields such as:
 
 ```text
-internalField uniform 0.01;
+fs
+CarbonL
+CarbonS
+macrosegregation
 ```
-
-Boundary conditions must be chosen consistently with the physical case.
-
-For casting cases, the nominal inlet composition should normally be consistent with the configured `CarbonRef`.
 
 ---
 
-# 10. Numerical considerations
+# Physical model
 
-## Carbon transport
+## 1. Flow
 
-The carbon equation requires appropriate discretization and solver entries.
+The liquid/mushy flow is treated as incompressible.
 
-A representative convection scheme is:
+The momentum equation includes:
 
-```text
-div(phiCarbon,Carbon) Gauss upwind;
-```
-
-and the scalar requires a solver entry in `fvSolution`.
-
-The exact schemes used in final simulations should be chosen according to mesh quality, stability and accuracy requirements.
-
-## Time step
-
-Casting, buoyancy, EMS and segregation can produce strongly coupled transients.
-
-Use a time step compatible with the velocity Courant number and, where appropriate, `adjustableRunTime` / `maxCo`.
-
-## Mushy-zone damping
-
-The solidification model uses a Darcy-like momentum resistance in partially solid cells.
-
-The corresponding coefficient strongly affects how rapidly velocity is suppressed as liquid fraction falls and should therefore be treated as a physical/numerical model parameter rather than an arbitrary tuning constant.
-
----
-
-# 11. Validation history
-
-Development has been intentionally divided into gates so that each added mechanism is validated before being introduced into the full continuous-casting case.
-
-## Gate 1 — Solidification sanity checks
-
-Validated basic phase-change behavior and mushy-zone evolution.
-
-## Gate 2 — Continuous casting
-
-Added:
-
-- mapped thermal initialization;
-- strand withdrawal;
-- conservative latent-energy transport;
+- pressure;
+- viscous diffusion;
 - thermal buoyancy;
-- three-dimensional casting flow;
-- turbulence.
+- solutal buoyancy;
+- BKC Darcy resistance in the mushy zone.
 
-The developed no-EMS casting solution became the baseline for later work.
-
-## Gate 3 — Electromagnetic stirring
-
-Validated the prescribed EMS source independently before coupling it to the caster.
-
-Checks included:
-
-- force magnitude;
-- direction/sign;
-- spatial distribution;
-- net force;
-- torque;
-- resulting flow rotation;
-- interaction with thermal buoyancy.
-
-The present EMS implementation is a **prescribed Lorentz-force model**. It does not solve Maxwell's equations internally.
-
-## Gate 4 — Macrosegregation
-
-Added:
-
-- `Carbon`;
-- `CarbonL`;
-- `CarbonS`;
-- partitioning;
-- carbon transport;
-- macrosegregation in the full caster.
-
-No-EMS and EMS cases were compared after temporal development.
-
-The tested EMS intensity did not improve segregation in the studied configuration and produced stronger segregation in the comparison performed during validation.
-
-## Gate 5A — Composition-dependent phase equilibrium
-
-Added:
-
-- composition-dependent liquidus behavior;
-- coupling of `CarbonL` to phase equilibrium;
-- corresponding composition-dependent liquid fraction;
-- dedicated 1D / no-flow validation.
-
-Gate 5A is frozen in Git as:
-
-```text
-gate5a-complete
-```
+The validated AFRODITE case used laminar Stokes momentum transport.
 
 ---
 
-# 12. Current development: Gate 5B
+## 2. Thermo-solutal buoyancy
 
-Gate 5B is intended to add **solutal buoyancy**.
+The benchmark Boussinesq source is implemented in the form
 
-The planned extension is to modify the Boussinesq density contribution from a purely thermal form to a thermosolutal form, conceptually:
+\[
+\mathbf{a}_b
+=
+-\mathbf{g}\,\beta_T\,(T-T_{ref})
+-\mathbf{g}\,\beta_C\,(C_l-C_0).
+\]
+
+where:
+
+- \(T\) is temperature;
+- \(T_{ref}\) is the reference temperature;
+- \(C_l\) is liquid composition;
+- \(C_0\) is nominal alloy composition;
+- \(\beta_T\) is the thermal expansion coefficient;
+- \(\beta_C\) is the solutal expansion coefficient.
+
+The AFRODITE Sn–Pb benchmark uses a negative solutal expansion coefficient, making Pb-rich liquid denser and therefore gravitationally unstable in the expected direction.
+
+---
+
+## 3. Phase equilibrium
+
+The binary phase diagram is represented using linear liquidus and solidus relations.
+
+Liquidus:
+
+\[
+T_{liq}
+=
+T_{melt}
++
+m_{liq} C
+\]
+
+Solidus:
+
+\[
+T_{sol}
+=
+T_{melt}
++
+m_{liq}\frac{C}{k_p}
+\]
+
+where:
+
+- \(T_{melt}\) is the pure-solvent melting temperature;
+- \(m_{liq}\) is the liquidus slope;
+- \(C\) is local mixture composition;
+- \(k_p\) is the partition coefficient.
+
+In the mushy interval, the solid fraction follows the lever-rule expression
+
+\[
+f_s
+=
+\frac{1}{1-k_p}
+\frac{T-T_{liq}}{T-T_{melt}}.
+\]
+
+The phase compositions are reconstructed from the mixture composition:
+
+\[
+C_l
+=
+\frac{C}
+{1+f_s(k_p-1)}
+\]
+
+and
+
+\[
+C_s
+=
+k_p C_l.
+\]
+
+The implementation enforces the mixture closure
+
+\[
+C=f_s C_s+(1-f_s)C_l.
+\]
+
+---
+
+## 4. BKC mushy-zone resistance
+
+The standard BKC permeability relation is used.
+
+\[
+K_0
+=
+\frac{\lambda_2^2}{180}
+\]
+
+with \(\lambda_2\) the secondary dendrite arm spacing.
+
+The inverse permeability is
+
+\[
+K^{-1}
+=
+K_0^{-1}
+\frac{f_{s,B}^2}
+{(1-f_{s,B})^3}
+\]
+
+with the bounded solid fraction
+
+\[
+f_{s,B}=\min(f_s,0.99).
+\]
+
+The momentum sink is
+
+\[
+S_u
+=
+-\frac{\mu_l}{K}
+(\mathbf{u}-\mathbf{u}_s).
+\]
+
+For the validated standard BKC benchmark,
+
+\[
+\mathbf{u}_s=0.
+\]
+
+The resistance is added implicitly to the momentum equation.
+
+This is important: the validated AFRODITE implementation is the stationary-solid BKC model. A nonzero solid withdrawal velocity for continuous casting is a later extension and is not part of the benchmark tag.
+
+---
+
+## 5. Thermal properties
+
+Heat capacity is phase weighted:
+
+\[
+c_p
+=
+f_s c_{p,s}
++
+(1-f_s)c_{p,l}.
+\]
+
+Thermal conductivity is likewise phase weighted:
+
+\[
+k_{eff}
+=
+f_s k_s
++
+(1-f_s)k_l.
+\]
+
+For the equal-density benchmark formulation, the volume and mass phase fractions coincide.
+
+---
+
+## 6. Energy equation
+
+The implementation follows the benchmark energy formulation.
+
+For the standard BKC case with stationary solid,
+
+\[
+\mathbf{u}_s=0,
+\]
+
+the latent convective terms in the published formulation cancel exactly.
+
+The local latent contribution follows the benchmark approximation
+
+\[
+\frac{\partial(\rho L f_s)}{\partial t}
+=
+\rho L
+\frac{\partial f_s}{\partial T}
+\frac{\partial T}{\partial t}.
+\]
+
+Accordingly, the implementation uses the analytical lever-rule derivative \(\partial f_s/\partial T\).
+
+The solver does **not** introduce an additional
+
+\[
+\frac{\partial f_s}{\partial C}
+\frac{\partial C}{\partial t}
+\]
+
+latent source, because that term is not part of the benchmark formulation being reproduced.
+
+The sensible energy transport uses the phase-weighted product \(c_p T\). To preserve the intended product-advection form while retaining an implicit finite-volume solve, the implementation uses an implicit split plus deferred correction.
+
+---
+
+## 7. Species transport
+
+The mixture composition field is named:
 
 ```text
-rho ≈ rhoRef * [1 - betaT*(T - TRef) - betaC*(CarbonL - CarbonRef)]
+Carbon
 ```
 
-This introduces the additional feedback:
+This naming convention is deliberate; `C` is avoided because OpenFOAM commonly uses `C` for cell-centre coordinates.
+
+Associated derived phase fields are:
 
 ```text
 CarbonL
-  ↓
-liquid density
-  ↓
-solutal buoyancy
-  ↓
-flow
-  ↓
-Carbon transport
+CarbonS
 ```
 
-Development is isolated on:
+The species equation is implemented term-by-term following the benchmark equal-density binary-alloy form rather than algebraically collapsing the advection to a single `div(U*Cl)` operator.
 
-```text
-gate5b-solutal-buoyancy
-```
+This distinction matters numerically: two continuously equivalent forms are not necessarily equivalent under the same finite-volume discretization.
 
-The intended validation sequence is:
+The implemented structure contains:
 
-1. solutal buoyancy in a simple liquid domain;
-2. combined thermal + solutal buoyancy;
-3. full continuous-casting coupling.
+- mixture composition transient term;
+- mixture advection;
+- mixture diffusivity;
+- liquid-phase diffusion correction;
+- solid-phase diffusion correction;
+- relative liquid-composition advection correction.
+
+The phase-weighted mixture diffusivity is
+
+\[
+D
+=
+f_s D_s
++
+(1-f_s)D_l.
+\]
+
+For the AFRODITE benchmark:
+
+\[
+D_s=0.
+\]
 
 ---
 
-# 13. Physics not yet included
+## 8. Macrosegregation
 
-The current model should not be interpreted as a complete industrial steel-solidification package.
+Macrosegregation is reported as
 
-Important effects not presently included include:
+\[
+MS
+=
+\frac{C-C_0}{C_0}\times 100\%.
+\]
 
-- finite solid-state back diffusion;
-- Scheil-type microsegregation;
-- multicomponent alloy chemistry;
-- variable partition coefficients from full thermodynamic databases;
-- full CALPHAD coupling;
-- grain nucleation and grain-structure evolution;
-- equiaxed crystal transport;
-- shrinkage-driven flow;
-- porosity formation;
-- free-surface / mold-powder dynamics;
-- air-gap formation;
-- contact-resistance evolution;
-- deformation of the solid shell;
-- internally solved electromagnetic fields;
-- induced-current calculation;
-- Joule heating.
-
-These are possible future extensions, not requirements for using the current binary macrosegregation model.
+Positive values indicate local enrichment relative to the nominal alloy composition, and negative values indicate depletion.
 
 ---
 
-# 14. EMS model limitation
+# Nonlinear coupling
 
-EMS is presently represented as a prescribed Lorentz-force field:
+Solidification, thermal properties, latent heat, species partitioning, and buoyancy are strongly coupled.
+
+The benchmark solver therefore performs multiple solidification corrections per time step.
+
+The validated AFRODITE setup used:
 
 ```text
-FL = FL(x,t)
+nSolidificationLoops 5;
 ```
 
-which is inserted into the momentum equation.
-
-This is suitable when electromagnetic forces are known analytically or obtained from an external electromagnetic model.
-
-The implementation does **not** currently solve the electromagnetic field equations or their mutual coupling with the fluid.
-
-Therefore the EMS implementation should be understood as a reduced-order MHD coupling rather than a complete electromagnetic solver.
+Within these corrections the solver updates the phase state and associated thermophysical fields until the coupled temperature/composition/solid-fraction state is sufficiently converged for that time step.
 
 ---
 
-# 15. Git workflow
+# AFRODITE benchmark
 
-The GitHub repository is the source of truth for the custom code.
+The principal validation case is the AFRODITE Sn–3 wt% Pb cavity benchmark.
 
-Current important references:
+Geometry:
 
 ```text
-main
-gate5a-complete
-gate5b-solutal-buoyancy
+100 mm × 60 mm × 10 mm
 ```
 
-Recommended development workflow:
+The numerical model is effectively two-dimensional, using one cell through thickness.
+
+Validated mesh:
+
+```text
+100 × 60 × 1
+```
+
+for a total of:
+
+```text
+6000 cells
+```
+
+Typical gravity:
+
+```text
+(0 -9.81 0)
+```
+
+Initial alloy composition:
+
+```text
+C0 = 0.03
+```
+
+Initial temperature:
+
+```text
+531.75 K
+```
+
+The thermal boundary condition follows the AFRODITE benchmark heating/cooling schedule used in the reference implementation.
+
+---
+
+## AFRODITE material properties
+
+The validated case used approximately:
+
+```text
+rho             7130 kg/m3
+
+CpSolid          209 J/(kg K)
+CpLiquid         243 J/(kg K)
+
+kSolid            55 W/(m K)
+kLiquid           33 W/(m K)
+
+latentHeat     56140 J/kg
+
+muLiquid        0.002 Pa s
+
+DL              3.5e-9 m2/s
+DS              0
+
+betaT           9.5e-5 1/K
+betaC          -0.53
+
+lambda2         9.0e-5 m
+
+Tmelt           505.15 K
+liquidusSlope  -128.6089 K/(mass fraction)
+kp              0.0656
+
+TRef            531.75 K
+Carbon0         0.03
+```
+
+These values belong to the AFRODITE benchmark configuration and should not be treated as generic steel properties.
+
+---
+
+# Recommended numerical settings
+
+The validated benchmark configuration used:
+
+```text
+Time scheme:
+    Euler
+
+Gradient:
+    Gauss linear
+
+Interpolation:
+    linear
+
+Advection:
+    bounded Gauss linearUpwind
+
+Diffusion:
+    Gauss linear corrected
+```
+
+Pressure:
+
+```text
+GAMG
+tolerance 1e-6
+```
+
+Velocity, temperature and composition:
+
+```text
+PBiCGStab
+DILU
+tolerance 1e-8
+```
+
+Pressure-velocity coupling:
+
+```text
+PIMPLE/PISO-style
+nCorrectors 2
+```
+
+Adaptive time stepping was used with approximately:
+
+```text
+maxCo       0.5
+maxDeltaT   0.05
+```
+
+---
+
+# Validation status
+
+The current solver reproduces the principal behaviour of the standard BKC implementation reported for the AFRODITE benchmark.
+
+At approximately 2250 s, the validated solution showed:
+
+- a solidification-front position close to the published standard-BKC result;
+- liquid velocities of the same order and profile as the benchmark;
+- strong mushy-zone damping;
+- the expected dense solute-rich lower region caused by Pb segregation;
+- conserved global alloy inventory;
+- converged nonlinear solidification corrections.
+
+The remaining differences observed during validation were profile-level differences rather than evidence of a missing dominant model term.
+
+---
+
+## Energy-conservation validation
+
+A dedicated discrete energy audit was added before freezing the validated BKC milestone.
+
+The older field-based diagnostic showed an apparent global mismatch of roughly 5%, but this was traced to the diagnostic definition rather than the solved equation.
+
+The discrete finite-volume Eq. (13) audit showed residuals on the order of approximately:
+
+```text
+~1e-3 W
+```
+
+against equation terms of approximately:
+
+```text
+20–25 W
+```
+
+corresponding to relative errors of only a few \(10^{-5}\), i.e. of order:
+
+```text
+~0.004 %
+```
+
+on average in the final validation window.
+
+This confirmed that the assembled energy equation is internally conservative to a level far below the benchmark-model uncertainty.
+
+---
+
+# Important implementation notes
+
+## Discrete equivalence matters
+
+During development, an algebraically simplified species-advection form was found to produce noticeably different hydrodynamics from the term-by-term benchmark equation when discretized with bounded `linearUpwind`.
+
+The final solver therefore keeps the benchmark species equation in its explicit term-by-term form.
+
+The same principle is used for the energy advection treatment.
+
+---
+
+## Stationary solid in the validated benchmark
+
+The validated BKC milestone assumes:
+
+```text
+solid velocity = 0
+```
+
+This must not be confused with the intended continuous-casting extension, where the solid shell is withdrawn through the domain.
+
+Any introduction of `pullVelocity` should be treated as a new model extension and validated independently against the frozen BKC baseline.
+
+---
+
+## Equal-density formulation
+
+The AFRODITE benchmark used the equal-density binary-alloy simplification.
+
+Therefore the current validated implementation should not automatically be interpreted as a full variable-density multicomponent solidification solver.
+
+---
+
+# Legacy implementation
+
+The repository also contains the earlier custom fvModel development under:
+
+```text
+src/
+```
+
+That code includes the original continuous-casting-oriented `castingSolidificationMelting` model and associated macrosegregation developments.
+
+It remains useful because it contains earlier work on:
+
+- continuous-casting pull velocity;
+- composition-dependent phase equilibrium;
+- thermo-solutal buoyancy;
+- electromagnetic stirring coupling;
+- macrosegregation transport.
+
+However, the new `binaryAlloyMacrosegregation` solver is the reference implementation for BKC physics and benchmark fidelity.
+
+The legacy implementation should therefore be documented and maintained separately rather than mixed with the validated benchmark description.
+
+---
+
+# Development workflow
+
+The validated BKC state is preserved by the Git tag:
 
 ```bash
-git status
-git diff
-
-# edit / compile / validate
-
-git add .
-git commit -m "Describe the implemented change"
-git push
+git checkout afrodite-bkc-validated
 ```
 
-Before starting a new major model extension, create a dedicated branch or tag a known working state.
+Do not develop new continuous-casting features directly on the validation tag.
 
-Example:
+A recommended workflow for future development is:
 
 ```bash
-git tag some-stable-milestone
-git push origin some-stable-milestone
+git checkout main
+git pull
+git checkout -b <new-feature-branch>
 ```
 
-This keeps validated physics reproducible while allowing experimental development to proceed safely.
-
----
-
-# 16. Reproducing the development environment
-
-A minimal setup workflow is:
-
-```bash
-# Clone
-git clone git@github.com:denyriva/continuous-casting-openfoam.git
-
-cd continuous-casting-openfoam
-
-# Build solidification model
-cd src/castingSolidificationMelting
-wmake libso
-
-# Build macrosegregation transport
-cd ../macrosegregationTransport
-wmake libso
-```
-
-A simulation case must then provide the appropriate:
+Examples:
 
 ```text
-0/
-constant/
-system/
+continuous-casting-pull-velocity
+moving-solid-bkc
+continuous-casting-validation
 ```
 
-dictionaries and load the custom libraries.
-
-Validation cases are not yet part of this repository.
+This keeps the AFRODITE benchmark state recoverable at all times.
 
 ---
 
-# 17. Project philosophy
+# Next development stage
 
-The project follows a deliberately staged development approach:
+The natural next step is to extend the validated BKC model toward continuous casting.
 
-> **Do not add a physical coupling to the full caster until that coupling works in isolation.**
+The principal addition will be a nonzero solid velocity:
 
-Each major mechanism is therefore tested in progressively more complex configurations before being accepted into the complete continuous-casting model.
+\[
+\mathbf{u}_s \neq 0.
+\]
 
-This has been particularly important for:
+This affects more than the Darcy sink. It also changes the transport structure of the benchmark equations, particularly the relative momentum/species/latent transport terms.
 
-- strand withdrawal;
-- buoyancy;
-- EMS;
-- carbon transport;
-- phase partitioning;
-- composition-dependent liquidus behavior.
-
-The same strategy is intended for future solutal-buoyancy and microsegregation extensions.
+For that reason, the continuous-casting extension should be implemented incrementally and checked against the frozen standard-BKC baseline after each change.
 
 ---
 
-# 18. Disclaimer
+# Reference
 
-This repository is a research/development implementation.
+The implementation was benchmarked against the standard BKC formulation described in:
 
-Validation cases have been designed primarily to verify mathematical implementation, coupling direction, conservation and qualitative physical behavior. Some test parameters are intentionally artificial.
+**Moeinirad, S. & Amani, M. — “Systematic Benchmarking of Macrosegregation: The Performance of a Modified Hybrid Model.”**
 
-Before using the model for engineering prediction, alloy-specific thermophysical and thermodynamic properties, numerical sensitivity, mesh convergence and comparison against experimental or industrial data should be established.
-
----
-
-# 19. License and upstream code
-
-This project contains custom code developed against OpenFOAM Foundation v14 and may include code structurally derived from or adapted from OpenFOAM components.
-
-Before publishing the repository publicly, the applicable OpenFOAM licensing requirements and attribution should be reviewed and an appropriate repository license should be added.
-
-OpenFOAM Foundation source code is distributed under the GNU General Public License.
+The AFRODITE Sn–3 wt% Pb solidification benchmark described in that work was used as the principal reference case for the current solver.
 
 ---
 
-## Status summary
+# Status
 
-| Capability | Status |
-|---|---|
-| Thermal solidification | Implemented |
-| Mushy-zone damping | Implemented |
-| Strand withdrawal | Implemented |
-| Conservative latent-energy transport | Implemented |
-| Thermal buoyancy | Implemented |
-| SST turbulence | Supported |
-| Carbon transport | Implemented |
-| Liquid/solid partitioning | Implemented |
-| Macrosegregation | Implemented |
-| Composition-dependent liquidus | Implemented |
-| Composition-dependent liquid fraction | Implemented |
-| Prescribed EMS | Implemented |
-| Solutal buoyancy | In development |
-| Finite back diffusion | Not implemented |
-| Multicomponent alloy | Not implemented |
-| Full electromagnetic solution | Not implemented |
+Current project status:
+
+```text
+Standard BKC benchmark implementation: validated
+AFRODITE benchmark: reproduced with good fidelity
+Energy discrete balance: validated
+Species inventory: conserved
+Continuous-casting pull velocity: not yet added to the validated BKC solver
+```
+
+Validated Git milestone:
+
+```text
+afrodite-bkc-validated
+```
