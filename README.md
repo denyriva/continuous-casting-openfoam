@@ -173,21 +173,21 @@ The validated AFRODITE case used laminar Stokes momentum transport.
 
 The benchmark Boussinesq source is implemented in the form
 
-\[
+$$
 \mathbf{a}_b
 =
 -\mathbf{g}\,\beta_T\,(T-T_{ref})
 -\mathbf{g}\,\beta_C\,(C_l-C_0).
-\]
+$$
 
 where:
 
-- \(T\) is temperature;
-- \(T_{ref}\) is the reference temperature;
-- \(C_l\) is liquid composition;
-- \(C_0\) is nominal alloy composition;
-- \(\beta_T\) is the thermal expansion coefficient;
-- \(\beta_C\) is the solutal expansion coefficient.
+- $T$ is temperature;
+- $T_{ref}$ is the reference temperature;
+- $C_l$ is liquid composition;
+- $C_0$ is nominal alloy composition;
+- $\beta_T$ is the thermal expansion coefficient;
+- $\beta_C$ is the solutal expansion coefficient.
 
 The AFRODITE Sn–Pb benchmark uses a negative solutal expansion coefficient, making Pb-rich liquid denser and therefore gravitationally unstable in the expected direction.
 
@@ -199,62 +199,62 @@ The binary phase diagram is represented using linear liquidus and solidus relati
 
 Liquidus:
 
-\[
+$$
 T_{liq}
 =
 T_{melt}
 +
 m_{liq} C
-\]
+$$
 
 Solidus:
 
-\[
+$$
 T_{sol}
 =
 T_{melt}
 +
 m_{liq}\frac{C}{k_p}
-\]
+$$
 
 where:
 
-- \(T_{melt}\) is the pure-solvent melting temperature;
-- \(m_{liq}\) is the liquidus slope;
-- \(C\) is local mixture composition;
-- \(k_p\) is the partition coefficient.
+- $T_{melt}$ is the pure-solvent melting temperature;
+- $m_{liq}$ is the liquidus slope;
+- $C$ is local mixture composition;
+- $k_p$ is the partition coefficient.
 
 In the mushy interval, the solid fraction follows the lever-rule expression
 
-\[
+$$
 f_s
 =
 \frac{1}{1-k_p}
 \frac{T-T_{liq}}{T-T_{melt}}.
-\]
+$$
 
 The phase compositions are reconstructed from the mixture composition:
 
-\[
+$$
 C_l
 =
 \frac{C}
 {1+f_s(k_p-1)}
-\]
+$$
 
 and
 
-\[
+$$
 C_s
 =
 k_p C_l.
-\]
+$$
 
 The implementation enforces the mixture closure
 
-\[
+$$
 C=f_s C_s+(1-f_s)C_l.
-\]
+$$
 
 ---
 
@@ -262,44 +262,44 @@ C=f_s C_s+(1-f_s)C_l.
 
 The standard BKC permeability relation is used.
 
-\[
+$$
 K_0
 =
 \frac{\lambda_2^2}{180}
-\]
+$$
 
-with \(\lambda_2\) the secondary dendrite arm spacing.
+with $\lambda_2$ the secondary dendrite arm spacing.
 
 The inverse permeability is
 
-\[
+$$
 K^{-1}
 =
 K_0^{-1}
 \frac{f_{s,B}^2}
 {(1-f_{s,B})^3}
-\]
+$$
 
 with the bounded solid fraction
 
-\[
+$$
 f_{s,B}=\min(f_s,0.99).
-\]
+$$
 
 The momentum sink is
 
-\[
+$$
 S_u
 =
 -\frac{\mu_l}{K}
 (\mathbf{u}-\mathbf{u}_s).
-\]
+$$
 
 For the validated standard BKC benchmark,
 
-\[
+$$
 \mathbf{u}_s=0.
-\]
+$$
 
 The resistance is added implicitly to the momentum equation.
 
@@ -311,23 +311,23 @@ This is important: the validated AFRODITE implementation is the stationary-solid
 
 Heat capacity is phase weighted:
 
-\[
+$$
 c_p
 =
 f_s c_{p,s}
 +
 (1-f_s)c_{p,l}.
-\]
+$$
 
 Thermal conductivity is likewise phase weighted:
 
-\[
+$$
 k_{eff}
 =
 f_s k_s
 +
 (1-f_s)k_l.
-\]
+$$
 
 For the equal-density benchmark formulation, the volume and mass phase fractions coincide.
 
@@ -339,34 +339,34 @@ The implementation follows the benchmark energy formulation.
 
 For the standard BKC case with stationary solid,
 
-\[
+$$
 \mathbf{u}_s=0,
-\]
+$$
 
 the latent convective terms in the published formulation cancel exactly.
 
 The local latent contribution follows the benchmark approximation
 
-\[
+$$
 \frac{\partial(\rho L f_s)}{\partial t}
 =
 \rho L
 \frac{\partial f_s}{\partial T}
 \frac{\partial T}{\partial t}.
-\]
+$$
 
-Accordingly, the implementation uses the analytical lever-rule derivative \(\partial f_s/\partial T\).
+Accordingly, the implementation uses the analytical lever-rule derivative $\partial f_s/\partial T$.
 
 The solver does **not** introduce an additional
 
-\[
+$$
 \frac{\partial f_s}{\partial C}
 \frac{\partial C}{\partial t}
-\]
+$$
 
 latent source, because that term is not part of the benchmark formulation being reproduced.
 
-The sensible energy transport uses the phase-weighted product \(c_p T\). To preserve the intended product-advection form while retaining an implicit finite-volume solve, the implementation uses an implicit split plus deferred correction.
+The sensible energy transport uses the phase-weighted product $c_p T$. To preserve the intended product-advection form while retaining an implicit finite-volume solve, the implementation uses an implicit split plus deferred correction.
 
 ---
 
@@ -402,19 +402,19 @@ The implemented structure contains:
 
 The phase-weighted mixture diffusivity is
 
-\[
+$$
 D
 =
 f_s D_s
 +
 (1-f_s)D_l.
-\]
+$$
 
 For the AFRODITE benchmark:
 
-\[
+$$
 D_s=0.
-\]
+$$
 
 ---
 
@@ -422,11 +422,11 @@ D_s=0.
 
 Macrosegregation is reported as
 
-\[
+$$
 MS
 =
 \frac{C-C_0}{C_0}\times 100\%.
-\]
+$$
 
 Positive values indicate local enrichment relative to the nominal alloy composition, and negative values indicate depletion.
 
@@ -618,7 +618,7 @@ against equation terms of approximately:
 20–25 W
 ```
 
-corresponding to relative errors of only a few \(10^{-5}\), i.e. of order:
+corresponding to relative errors of only a few $10^{-5}$, i.e. of order:
 
 ```text
 ~0.004 %
@@ -724,9 +724,9 @@ The natural next step is to extend the validated BKC model toward continuous cas
 
 The principal addition will be a nonzero solid velocity:
 
-\[
+$$
 \mathbf{u}_s \neq 0.
-\]
+$$
 
 This affects more than the Darcy sink. It also changes the transport structure of the benchmark equations, particularly the relative momentum/species/latent transport terms.
 
