@@ -173,13 +173,12 @@ The validated AFRODITE case used laminar Stokes momentum transport.
 
 The benchmark Boussinesq source is implemented in the form
 
-$$
+```math
 \mathbf{a}_b
 =
 -\mathbf{g}\,\beta_T\,(T-T_{ref})
 -\mathbf{g}\,\beta_C\,(C_l-C_0).
-$$
-
+```
 where:
 
 - $T$ is temperature;
@@ -199,24 +198,22 @@ The binary phase diagram is represented using linear liquidus and solidus relati
 
 Liquidus:
 
-$$
+```math
 T_{liq}
 =
 T_{melt}
 +
 m_{liq} C
-$$
-
+```
 Solidus:
 
-$$
+```math
 T_{sol}
 =
 T_{melt}
 +
 m_{liq}\frac{C}{k_p}
-$$
-
+```
 where:
 
 - $T_{melt}$ is the pure-solvent melting temperature;
@@ -226,81 +223,72 @@ where:
 
 In the mushy interval, the solid fraction follows the lever-rule expression
 
-$$
+```math
 f_s
 =
 \frac{1}{1-k_p}
 \frac{T-T_{liq}}{T-T_{melt}}.
-$$
-
+```
 The phase compositions are reconstructed from the mixture composition:
 
-$$
+```math
 C_l
 =
 \frac{C}
 {1+f_s(k_p-1)}
-$$
-
+```
 and
 
-$$
+```math
 C_s
 =
 k_p C_l.
-$$
-
+```
 The implementation enforces the mixture closure
 
-$$
+```math
 C=f_s C_s+(1-f_s)C_l.
-$$
-
+```
 ---
 
 ## 4. BKC mushy-zone resistance
 
 The standard BKC permeability relation is used.
 
-$$
+```math
 K_0
 =
 \frac{\lambda_2^2}{180}
-$$
-
+```
 with $\lambda_2$ the secondary dendrite arm spacing.
 
 The inverse permeability is
 
-$$
+```math
 K^{-1}
 =
 K_0^{-1}
 \frac{f_{s,B}^2}
 {(1-f_{s,B})^3}
-$$
-
+```
 with the bounded solid fraction
 
-$$
+```math
 f_{s,B}=\min(f_s,0.99).
-$$
-
+```
 The momentum sink is
 
-$$
+```math
 S_u
 =
 -\frac{\mu_l}{K}
 (\mathbf{u}-\mathbf{u}_s).
-$$
-
+```
 For the validated standard BKC benchmark,
 
-$$
+```math
 \mathbf{u}_s=0.
-$$
-
+```
 The resistance is added implicitly to the momentum equation.
 
 This is important: the validated AFRODITE implementation is the stationary-solid BKC model. A nonzero solid withdrawal velocity for continuous casting is a later extension and is not part of the benchmark tag.
@@ -311,24 +299,22 @@ This is important: the validated AFRODITE implementation is the stationary-solid
 
 Heat capacity is phase weighted:
 
-$$
+```math
 c_p
 =
 f_s c_{p,s}
 +
 (1-f_s)c_{p,l}.
-$$
-
+```
 Thermal conductivity is likewise phase weighted:
 
-$$
+```math
 k_{eff}
 =
 f_s k_s
 +
 (1-f_s)k_l.
-$$
-
+```
 For the equal-density benchmark formulation, the volume and mass phase fractions coincide.
 
 ---
@@ -339,31 +325,28 @@ The implementation follows the benchmark energy formulation.
 
 For the standard BKC case with stationary solid,
 
-$$
+```math
 \mathbf{u}_s=0,
-$$
-
+```
 the latent convective terms in the published formulation cancel exactly.
 
 The local latent contribution follows the benchmark approximation
 
-$$
+```math
 \frac{\partial(\rho L f_s)}{\partial t}
 =
 \rho L
 \frac{\partial f_s}{\partial T}
 \frac{\partial T}{\partial t}.
-$$
-
+```
 Accordingly, the implementation uses the analytical lever-rule derivative $\partial f_s/\partial T$.
 
 The solver does **not** introduce an additional
 
-$$
+```math
 \frac{\partial f_s}{\partial C}
 \frac{\partial C}{\partial t}
-$$
-
+```
 latent source, because that term is not part of the benchmark formulation being reproduced.
 
 The sensible energy transport uses the phase-weighted product $c_p T$. To preserve the intended product-advection form while retaining an implicit finite-volume solve, the implementation uses an implicit split plus deferred correction.
@@ -402,32 +385,29 @@ The implemented structure contains:
 
 The phase-weighted mixture diffusivity is
 
-$$
+```math
 D
 =
 f_s D_s
 +
 (1-f_s)D_l.
-$$
-
+```
 For the AFRODITE benchmark:
 
-$$
+```math
 D_s=0.
-$$
-
+```
 ---
 
 ## 8. Macrosegregation
 
 Macrosegregation is reported as
 
-$$
+```math
 MS
 =
 \frac{C-C_0}{C_0}\times 100\%.
-$$
-
+```
 Positive values indicate local enrichment relative to the nominal alloy composition, and negative values indicate depletion.
 
 ---
@@ -724,10 +704,9 @@ The natural next step is to extend the validated BKC model toward continuous cas
 
 The principal addition will be a nonzero solid velocity:
 
-$$
+```math
 \mathbf{u}_s \neq 0.
-$$
-
+```
 This affects more than the Darcy sink. It also changes the transport structure of the benchmark equations, particularly the relative momentum/species/latent transport terms.
 
 For that reason, the continuous-casting extension should be implemented incrementally and checked against the frozen standard-BKC baseline after each change.
