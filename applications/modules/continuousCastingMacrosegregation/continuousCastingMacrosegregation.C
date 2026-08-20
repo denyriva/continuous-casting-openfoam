@@ -1803,28 +1803,34 @@ thermophysicalTransportPredictor()
 
 void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 {
-    // Standard-BKC energy equation following Moeinirad & Amani Eq. (13).
+    // Moving-solid standard-BKC energy equation following Eq. (13).
     //
-    // For standard BKC, us = 0, so the two convective latent-enthalpy terms
-    // cancel exactly:
+    // IMPORTANT CC-4 DISCRETIZATION CHOICE
+    // ------------------------------------
+    // Keep the two latent convective terms separate:
     //
-    //   +div(rho L fs U) - div(rho L fs (U-us)) = 0.
+    //   +div(rho L fs U)
+    //   -div(rho L fs (U-us))
     //
-    // With constant rho, but phase-dependent mixture Cp and k:
+    // even though they can be combined algebraically in the continuous
+    // equation. This mirrors the validated species treatment: distinct
+    // finite-volume advection operators are not collapsed because bounded
+    // interpolation can make the discrete operators non-equivalent.
+    //
+    // After division by constant rho:
     //
     //   d(CpMix*T)/dt + div(U CpMix T)
-    //       = div((kEff/rho) grad(T)) + L d(fs)/dt.
+    //       = div((kEff/rho) grad(T))
+    //       + L d(fs)/dt
+    //       + div(L fs U)
+    //       - div(L fs (U-us)).
     //
-    // Eq. (16) recasts the local latent term as
+    // Eq. (16) recasts the local latent-storage term as
     //
-    //   d(fs)/dt = (dfs/dT) dT/dt,
+    //   d(fs)/dt = (dfs/dT) dT/dt.
     //
-    // with dfs/dT evaluated analytically from the Lever rule. Therefore:
-    //
-    //   d(CpMix*T)/dt
-    // + [-L dfs/dT] dT/dt
-    // + div(U CpMix T)
-    // - div((kEff/rho) grad(T)) = 0.
+    // For solidVelocity = 0 the two separately discretized latent-advection
+    // terms use the same flux and cancel exactly, recovering CC-3.
     //
     // CpMix and kEff are frozen within each fixed-point solidification
     // correction and are updated from the new phase state after each solve.
@@ -1866,8 +1872,48 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
     CpMix_.oldTime();
     fs_.oldTime();
 
+    const dimensionedVector solidVelocityDim
+    (
+        "solidVelocity",
+        dimLength/dimTime,
+        solidVelocity_
+    );
+
+    const surfaceScalarField solidPhi
+    (
+        IOobject
+        (
+            "solidVelocityFluxEnergyTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        solidVelocityDim & mesh_.Sf()
+    );
+
+    const surfaceScalarField relativePhiEnergy
+    (
+        IOobject
+        (
+            "relativeVelocityFluxEnergyTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        phi_ - solidPhi
+    );
+
     Info<< "Solidification/variable-property energy coupling" << nl
         << "    Eq. (13) sensible advection = direct CpMix*T product" << nl
+        << "    CC-4 latent advection       = term-by-term" << nl
+        << "    bulk latent flux            = phi" << nl
+        << "    relative latent flux        = phi - phiSolid" << nl
+        << "    solidVelocity               = "
+        << solidVelocity_ << " m/s" << nl
         << "    loops = " << nSolidificationLoops_
         << endl;
 
@@ -1880,6 +1926,30 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         // Effective conductivity term after dividing Eq. (13) by rho.
         const tmp<volScalarField> tKbyRho =
             kEff_/rhoDim;
+
+        // CC-4 latent-energy advection terms are discretized separately.
+        //
+        // Bulk term:     div(L fs U)
+        // Relative term: div(L fs (U-us))
+        //
+        // Do not algebraically collapse these operators.
+        const tmp<volScalarField> tBulkLatentAdvection =
+            latentHeatDim
+           *fvc::div
+            (
+                phi_,
+                fs_,
+                "div(phi,T)"
+            );
+
+        const tmp<volScalarField> tRelativeLatentAdvection =
+            latentHeatDim
+           *fvc::div
+            (
+                relativePhiEnergy,
+                fs_,
+                "div(phi,T)"
+            );
 
         // Eq. (13) contains div(U * CpMix * T).
         //
@@ -1969,6 +2039,8 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
          ==
             rDeltaT*tLatentCp()*T_.oldTime()
           - tEnergyAdvectionCorrection()
+          + tBulkLatentAdvection()
+          - tRelativeLatentAdvection()
         );
 
         TEqn.solve();
@@ -1987,6 +2059,8 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         // + (-L*dfs/dT)*(T-Told)/dt
         // + div(interpolate(Cp)*phi,T)
         // + [directAdv(old iterate) - splitAdv(old iterate)]
+        // - div(L fs U)
+        // + div(L fs (U-us))
         // - laplacian(k/rho,T)
         // = 0.
         //
@@ -2033,6 +2107,8 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 tDiscreteSensibleStorage()
               + tDiscreteLatentStorage()
               + tDiscreteEffectiveAdvection()
+              - tBulkLatentAdvection()
+              + tRelativeLatentAdvection()
               - tDiscreteConduction();
 
             // Also evaluate the direct Cp*T advection with the converged T.
@@ -2062,6 +2138,8 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             scalar sensibleStoragePower = 0.0;
             scalar latentStoragePower = 0.0;
             scalar effectiveAdvectionPower = 0.0;
+            scalar bulkLatentAdvectionPower = 0.0;
+            scalar relativeLatentAdvectionPower = 0.0;
             scalar conductionPower = 0.0;
             scalar discreteResidualPower = 0.0;
             scalar directAdvectionFinalPower = 0.0;
@@ -2080,6 +2158,12 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 
             const volScalarField& effectiveAdvection =
                 tDiscreteEffectiveAdvection();
+
+            const volScalarField& bulkLatentAdvection =
+                tBulkLatentAdvection();
+
+            const volScalarField& relativeLatentAdvection =
+                tRelativeLatentAdvection();
 
             const volScalarField& conduction =
                 tDiscreteConduction();
@@ -2105,6 +2189,12 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 
                 effectiveAdvectionPower +=
                     rhoV*effectiveAdvection[celli];
+
+                bulkLatentAdvectionPower +=
+                    rhoV*bulkLatentAdvection[celli];
+
+                relativeLatentAdvectionPower +=
+                    rhoV*relativeLatentAdvection[celli];
 
                 conductionPower +=
                     rhoV*conduction[celli];
@@ -2141,6 +2231,20 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 
             effectiveAdvectionPower =
                 returnReduce(effectiveAdvectionPower, sumOp<scalar>());
+
+            bulkLatentAdvectionPower =
+                returnReduce
+                (
+                    bulkLatentAdvectionPower,
+                    sumOp<scalar>()
+                );
+
+            relativeLatentAdvectionPower =
+                returnReduce
+                (
+                    relativeLatentAdvectionPower,
+                    sumOp<scalar>()
+                );
 
             conductionPower =
                 returnReduce(conductionPower, sumOp<scalar>());
@@ -2181,7 +2285,15 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                         max
                         (
                             mag(effectiveAdvectionPower),
-                            mag(conductionPower)
+                            max
+                            (
+                                max
+                                (
+                                    mag(bulkLatentAdvectionPower),
+                                    mag(relativeLatentAdvectionPower)
+                                ),
+                                mag(conductionPower)
+                            )
                         ),
                         SMALL
                     )
@@ -2197,6 +2309,16 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 << latentStoragePower << " W" << nl
                 << "    effective advection used  = "
                 << effectiveAdvectionPower << " W" << nl
+                << "    bulk latent advection     = "
+                << bulkLatentAdvectionPower << " W" << nl
+                << "    relative latent advection = "
+                << relativeLatentAdvectionPower << " W" << nl
+                << "    max |bulk latent advection|     = "
+                << gMax(mag(bulkLatentAdvection.primitiveField()))
+                << " W/kg" << nl
+                << "    max |relative latent advection| = "
+                << gMax(mag(relativeLatentAdvection.primitiveField()))
+                << " W/kg" << nl
                 << "    conduction RHS            = "
                 << conductionPower << " W" << nl
                 << "    discrete residual         = "
