@@ -1251,6 +1251,14 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
     betaC_(alloyProperties_.lookup<scalar>("betaC")),
     TRef_(alloyProperties_.lookup<scalar>("TRef")),
     lambda2_(alloyProperties_.lookup<scalar>("lambda2")),
+    solidVelocity_
+    (
+        alloyProperties_.lookupOrDefault<vector>
+        (
+            "solidVelocity",
+            vector::zero
+        )
+    ),
     nSolidificationLoops_
     (
         alloyProperties_.lookup<label>("nSolidificationLoops")
@@ -1607,6 +1615,12 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << "    Eq. (13) advection = direct CpMix*T product" << nl
         << "    implementation     = implicit split + deferred correction" << nl
         << "    v11c change        = diagnostics only; solved equations unchanged"
+        << endl;
+
+    Info<< "continuousCastingMacrosegregation: solid-velocity infrastructure" << nl
+        << "    solidVelocity     = " << solidVelocity_ << " m/s" << nl
+        << "    |solidVelocity|   = " << mag(solidVelocity_) << " m/s" << nl
+        << "    CC-1 coupling     = diagnostics only; equations unchanged"
         << endl;
 
     Info<< "continuousCastingMacrosegregation: alloy properties" << nl

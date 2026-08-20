@@ -18,6 +18,9 @@ Description
     Current implementation stage:
       - standard incompressible pressure/velocity infrastructure;
       - alloy properties read from constant/alloyProperties;
+      - CC-1 prescribed solidVelocity infrastructure read from
+        constant/alloyProperties and reported diagnostically, without yet
+        modifying any governing equation;
       - temperature transport with dictionary-driven phase properties and
         phase-fraction-weighted Cp and k, with Eq. (13) sensible-energy
         advection discretized on the transported product Cp*T;
@@ -139,6 +142,10 @@ protected:
 
         //- Secondary dendrite-arm spacing [m]
         scalar lambda2_;
+
+        //- Prescribed solid velocity [m/s]
+        //  CC-1: read and diagnose only; not yet used in any equation
+        vector solidVelocity_;
 
         //- Number of fixed-point solidification/latent-heat coupling loops
         label nSolidificationLoops_;
