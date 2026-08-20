@@ -613,18 +613,22 @@ void Foam::solvers::continuousCastingMacrosegregation::updateBKCDrag
     const bool report
 )
 {
-    // Standard BKC, paper Eqs. (5) and (7):
+    // Moving-solid standard BKC:
     //
     //   K^-1 = K0^-1 fsB^2/(1-fsB)^3
     //   K0   = lambda2^2/180
     //   fsB  = min(fs, 0.99)
     //
-    // us = 0 for the AFRODITE benchmark. After division of momentum by
-    // constant rho, the Darcy acceleration is
+    // For continuous casting the dendritic skeleton moves with the prescribed
+    // solid velocity us. After division of momentum by constant rho, the
+    // Darcy acceleration is
     //
-    //   a_D = -(mu_l/rho) K^-1 U = -(nu_l/K) U.
+    //   a_D = -(mu_l/rho) K^-1 (U-us)
+    //       = -(nu_l/K) (U-us).
     //
-    // The standard-BKC model omits the relative-advection momentum term Sr.
+    // CC-2 introduces only this moving-solid BKC momentum coupling. The
+    // species and energy solid-velocity terms remain unchanged until CC-3
+    // and CC-4 respectively.
 
     const scalar K0 = sqr(lambda2_)/180.0;
     const scalar nuLiquid = muLiquid_/rho_;
@@ -634,8 +638,8 @@ void Foam::solvers::continuousCastingMacrosegregation::updateBKCDrag
     scalar minDragCoeff = GREAT;
     scalar maxDragCoeff = -GREAT;
     scalar maxDragAcceleration = 0.0;
-    scalar maxUMushy = 0.0;
-    scalar maxUSolidLike = 0.0;
+    scalar maxRelativeUMushy = 0.0;
+    scalar maxRelativeUSolidLike = 0.0;
     scalar integralDragForce = 0.0;
     vector netDragForce = vector::zero;
 
@@ -661,8 +665,11 @@ void Foam::solvers::continuousCastingMacrosegregation::updateBKCDrag
         const scalar dragCoeff =
             nuLiquid*invK;
 
+        const vector relativeVelocity =
+            U_[celli] - solidVelocity_;
+
         const vector dragAcceleration =
-            -dragCoeff*U_[celli];
+            -dragCoeff*relativeVelocity;
 
         bkcInvK_[celli] = invK;
         bkcDragCoeff_[celli] = dragCoeff;
@@ -678,14 +685,14 @@ void Foam::solvers::continuousCastingMacrosegregation::updateBKCDrag
 
         if (fsCell > SMALL && fsCell < 1.0 - SMALL)
         {
-            maxUMushy =
-                max(maxUMushy, mag(U_[celli]));
+            maxRelativeUMushy =
+                max(maxRelativeUMushy, mag(relativeVelocity));
         }
 
         if (fsCell >= 0.99)
         {
-            maxUSolidLike =
-                max(maxUSolidLike, mag(U_[celli]));
+            maxRelativeUSolidLike =
+                max(maxRelativeUSolidLike, mag(relativeVelocity));
         }
 
         const vector dragForce =
@@ -713,14 +720,18 @@ void Foam::solvers::continuousCastingMacrosegregation::updateBKCDrag
     maxDragCoeff = returnReduce(maxDragCoeff, maxOp<scalar>());
     maxDragAcceleration =
         returnReduce(maxDragAcceleration, maxOp<scalar>());
-    maxUMushy = returnReduce(maxUMushy, maxOp<scalar>());
-    maxUSolidLike = returnReduce(maxUSolidLike, maxOp<scalar>());
+    maxRelativeUMushy =
+        returnReduce(maxRelativeUMushy, maxOp<scalar>());
+    maxRelativeUSolidLike =
+        returnReduce(maxRelativeUSolidLike, maxOp<scalar>());
     integralDragForce =
         returnReduce(integralDragForce, sumOp<scalar>());
     netDragForce =
         returnReduce(netDragForce, sumOp<vector>());
 
-    Info<< "Standard-BKC permeability audit" << nl
+    Info<< "Moving-solid BKC permeability audit" << nl
+        << "    solidVelocity          = "
+        << solidVelocity_ << " m/s" << nl
         << "    K0                     = "
         << K0 << " m2" << nl
         << "    fsB cap                = 0.99" << nl
@@ -730,10 +741,10 @@ void Foam::solvers::continuousCastingMacrosegregation::updateBKCDrag
         << minDragCoeff << " " << maxDragCoeff << " 1/s" << nl
         << "    max(|a_D|)             = "
         << maxDragAcceleration << " m/s2" << nl
-        << "    max(|U|) mushy         = "
-        << maxUMushy << " m/s" << nl
-        << "    max(|U|) fs>=0.99      = "
-        << maxUSolidLike << " m/s" << nl
+        << "    max(|U-us|) mushy      = "
+        << maxRelativeUMushy << " m/s" << nl
+        << "    max(|U-us|) fs>=0.99   = "
+        << maxRelativeUSolidLike << " m/s" << nl
         << "    integral(|F_D| dV)     = "
         << integralDragForce << " N" << nl
         << "    net drag force         = "
@@ -1617,10 +1628,11 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << "    v11c change        = diagnostics only; solved equations unchanged"
         << endl;
 
-    Info<< "continuousCastingMacrosegregation: solid-velocity infrastructure" << nl
+    Info<< "continuousCastingMacrosegregation: solid-velocity coupling" << nl
         << "    solidVelocity     = " << solidVelocity_ << " m/s" << nl
         << "    |solidVelocity|   = " << mag(solidVelocity_) << " m/s" << nl
-        << "    CC-1 coupling     = diagnostics only; equations unchanged"
+        << "    CC-2 coupling     = moving-solid BKC momentum" << nl
+        << "    pending           = species (CC-3), energy (CC-4)"
         << endl;
 
     Info<< "continuousCastingMacrosegregation: alloy properties" << nl

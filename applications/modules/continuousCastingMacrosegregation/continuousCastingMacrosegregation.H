@@ -18,9 +18,8 @@ Description
     Current implementation stage:
       - standard incompressible pressure/velocity infrastructure;
       - alloy properties read from constant/alloyProperties;
-      - CC-1 prescribed solidVelocity infrastructure read from
-        constant/alloyProperties and reported diagnostically, without yet
-        modifying any governing equation;
+      - prescribed solidVelocity read from constant/alloyProperties;
+      - CC-2 moving-solid BKC momentum resistance based on U-solidVelocity;
       - temperature transport with dictionary-driven phase properties and
         phase-fraction-weighted Cp and k, with Eq. (13) sensible-energy
         advection discretized on the transported product Cp*T;
@@ -32,7 +31,7 @@ Description
         solidification iterations;
       - thermo-solutal Boussinesq buoyancy in momentum;
       - standard Blake-Kozeny-Carman (BKC) mushy-zone permeability and
-        implicit Darcy damping;
+        implicit Darcy damping toward the prescribed solid velocity;
       - Bennon-Incropera mixture species transport for the standard-BKC
         benchmark, discretized term-by-term as written in Eq. (19).
 
@@ -144,7 +143,7 @@ protected:
         scalar lambda2_;
 
         //- Prescribed solid velocity [m/s]
-        //  CC-1: read and diagnose only; not yet used in any equation
+        //  CC-2: used by moving-solid BKC momentum resistance
         vector solidVelocity_;
 
         //- Number of fixed-point solidification/latent-heat coupling loops
@@ -236,7 +235,7 @@ protected:
         //- Kinematic Darcy damping coefficient nu_l/K [1/s]
         volScalarField bkcDragCoeff_;
 
-        //- Darcy acceleration -nu_l/K * U [m/s2]
+        //- Darcy acceleration -nu_l/K * (U-solidVelocity) [m/s2]
         volVectorField bkcDragAcceleration_;
 
 
@@ -297,7 +296,7 @@ protected:
         //- Update thermo-solutal Boussinesq accelerations and diagnostics
         void updateBuoyancy();
 
-        //- Update standard-BKC permeability / Darcy damping fields.
+        //- Update moving-solid BKC permeability / Darcy damping fields.
         //  If report=true, print the global BKC audit.
         void updateBKCDrag(const bool report);
 
