@@ -740,3 +740,35 @@ Validated Git milestone:
 ```text
 afrodite-bkc-validated
 ```
+
+## CC-7 Fe-C material model — scope and limitations
+
+CC-7 introduces a physically based binary Fe-C material model into the continuous-casting solver.
+
+The current baseline includes:
+
+- composition-dependent liquidus and solidus temperatures;
+- Lever-rule equilibrium phase partitioning;
+- constant partition coefficient `kp`;
+- phase-dependent thermal conductivity;
+- latent heat;
+- constant representative liquid and solid carbon diffusivities;
+- BKC permeability based on a prescribed secondary dendrite arm spacing;
+- conservative mixture-species transport with separate liquid- and solid-phase diffusion contributions.
+
+The CC-7 validation showed that:
+
+- the Fe-C phase-equilibrium relations reproduce the expected fully liquid, mushy, and near-solid limits;
+- `CarbonS/CarbonL = kp` is satisfied;
+- total mixture Carbon is conserved numerically;
+- equilibrium partitioning alone does not create macrosegregation;
+- with `DL = DS = 0`, the mixture Carbon field remains essentially uniform;
+- enabling physical diffusivities produces conservative local Carbon redistribution driven by phase-composition gradients.
+
+### Important limitation
+
+CC-7 should be interpreted as a validated physical Fe-C baseline, not yet as a quantitatively complete industrial steel macrosegregation model.
+
+The current implementation still uses constant representative values of `DL` and `DS` and equilibrium Lever-rule partitioning. Temperature-dependent diffusivities, solid-state back diffusion / Voller-Beckermann-type microsegregation treatment, multicomponent solute effects, and other higher-fidelity steel solidification physics are not yet included.
+
+These effects are reserved for later model-development stages.
