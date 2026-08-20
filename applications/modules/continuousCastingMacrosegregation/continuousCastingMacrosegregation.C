@@ -121,6 +121,20 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
             << exit(FatalIOError);
     }
 
+    if (Prt_ <= SMALL)
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "Prt must be > 0. Current value: " << Prt_
+            << exit(FatalIOError);
+    }
+
+    if (Sct_ <= SMALL)
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "Sct must be > 0. Current value: " << Sct_
+            << exit(FatalIOError);
+    }
+
     if (lambda2_ <= SMALL)
     {
         FatalIOErrorInFunction(alloyProperties_)
@@ -760,6 +774,10 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
 {
     scalar minD = GREAT;
     scalar maxD = -GREAT;
+    scalar minNut = GREAT;
+    scalar maxNut = -GREAT;
+    scalar minDt = GREAT;
+    scalar maxDt = -GREAT;
     scalar minQ = GREAT;
     scalar maxQ = -GREAT;
     scalar minMS = GREAT;
@@ -777,6 +795,12 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
 
     const scalarField& V = mesh_.V();
 
+    const tmp<volScalarField> tNut =
+        momentumTransport->nut();
+
+    const volScalarField& nut =
+        tNut();
+
     forAll(Carbon_, celli)
     {
         const scalar fsCell =
@@ -785,8 +809,20 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
         const scalar flCell =
             1.0 - fsCell;
 
+        const scalar nutCell =
+            max(nut[celli], scalar(0));
+
+        const scalar DtCell =
+            nutCell/Sct_;
+
+        // CC-8: turbulent species diffusion is a liquid-phase contribution.
+        // The implicit mixture coefficient is paired with explicit
+        // phase-difference corrections in solveSpeciesTransport(), so the
+        // converged flux is
+        //
+        //   fl*(DL + nut/Sct)*grad(Cl) + fs*DS*grad(Cs).
         const scalar DCell =
-            fsCell*DS_ + flCell*DL_;
+            fsCell*DS_ + flCell*(DL_ + DtCell);
 
         const scalar denominator =
             1.0 + fsCell*(kp_ - 1.0);
@@ -814,6 +850,12 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
 
         minD = min(minD, DCell);
         maxD = max(maxD, DCell);
+
+        minNut = min(minNut, nutCell);
+        maxNut = max(maxNut, nutCell);
+
+        minDt = min(minDt, DtCell);
+        maxDt = max(maxDt, DtCell);
 
         minQ = min(minQ, qCell);
         maxQ = max(maxQ, qCell);
@@ -845,6 +887,12 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
 
     minD = returnReduce(minD, minOp<scalar>());
     maxD = returnReduce(maxD, maxOp<scalar>());
+
+    minNut = returnReduce(minNut, minOp<scalar>());
+    maxNut = returnReduce(maxNut, maxOp<scalar>());
+
+    minDt = returnReduce(minDt, minOp<scalar>());
+    maxDt = returnReduce(maxDt, maxOp<scalar>());
 
     minQ = returnReduce(minQ, minOp<scalar>());
     maxQ = returnReduce(maxQ, maxOp<scalar>());
@@ -884,8 +932,12 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
         << minCl << " " << maxCl << nl
         << "    CarbonS min/max         = "
         << minCs << " " << maxCs << nl
-        << "    Dmix min/max            = "
+        << "    DmixEff min/max         = "
         << minD << " " << maxD << " m2/s" << nl
+        << "    nut min/max             = "
+        << minNut << " " << maxNut << " m2/s" << nl
+        << "    Dt=nut/Sct min/max      = "
+        << minDt << " " << maxDt << " m2/s" << nl
         << "    CarbonL/Carbon min/max  = "
         << minQ << " " << maxQ << nl
         << "    MS min/max              = "
@@ -906,10 +958,19 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
     // Bennon-Incropera mixture species equation used by the paper, Eq. (19):
     //
     // d(C)/dt + div(U C)
-    //   = div(D grad(C))
-    //   + div(fl Dl grad(Cl-C))
+    //   = div(DmixEff grad(C))
+    //   + div(fl DlEff grad(Cl-C))
     //   + div(fs Ds grad(Cs-C))
-    //   - div((U-us)(Cl-C)).
+    //   - div((U-us)(Cl-C)),
+    //
+    // where, for CC-8,
+    //
+    //   DlEff   = DL + nut/Sct
+    //   DmixEff = fs*DS + fl*DlEff.
+    //
+    // Hence the converged diffusive flux remains phase-separated:
+    //
+    //   fl*DlEff*grad(Cl) + fs*DS*grad(Cs).
     //
     // For moving solid, us is the prescribed uniform solidVelocity_.
     // The bulk mixture advection remains based on U/phi; only the explicit
@@ -946,6 +1007,23 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
         "DS",
         dimArea/dimTime,
         DS_
+    );
+
+    const tmp<volScalarField> tNutSpecies =
+        momentumTransport->nut();
+
+    const volScalarField effectiveLiquidDiffusivity
+    (
+        IOobject
+        (
+            "effectiveLiquidDiffusivityTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        DLDim + tNutSpecies()/Sct_
     );
 
     const volScalarField liquidFraction
@@ -1030,7 +1108,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
      ==
         fvc::laplacian
         (
-            liquidFraction*DLDim,
+            liquidFraction*effectiveLiquidDiffusivity,
             CarbonL_ - Carbon_
         )
       + fvc::laplacian
@@ -1069,22 +1147,34 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
 
 void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics() const
 {
-    // Eq. (13), standard BKC, us = 0:
+    // Global moving-solid Eq. (13) audit.
     //
-    //   d(rho Cp T)/dt + div(rho U Cp T)
-    //     = div(k grad T) + d(rho L fs)/dt.
+    // The implemented energy equation is, after division by rho,
     //
-    // In the closed AFRODITE cavity the normal advective flux is zero.
-    // Rearranging the latent term gives the globally conserved quantity
+    //   d(Cp*T)/dt
+    // + div(U Cp T)
+    // - d(L fs)/dt
+    // - div(L fs U)
+    // + div(L fs (U-us))
+    // - div((kEff/rho + fl CpL nut/Prt) grad(T))
+    // = 0.
+    //
+    // Hence
     //
     //   E* = integral rho (Cp*T - L*fs) dV,
     //
-    // for which
+    // and the open-domain global balance is
     //
-    //   dE*/dt = integral_boundary k grad(T).n dA.
+    //   dE*/dt
+    // + PsensibleAdv
+    // - PbulkLatentAdv
+    // + PrelativeLatentAdv
+    // - Pconduction
+    // = 0.
     //
-    // The sign convention below is therefore positive when the boundary
-    // conduction term adds energy to the domain and negative when heat leaves.
+    // The three advective operators are intentionally evaluated separately,
+    // matching the solver discretization.  This keeps the audit valid for
+    // continuous-casting inlet/outlet boundaries as well as closed cavities.
 
     const scalar deltaTValue = runTime.deltaTValue();
 
@@ -1151,7 +1241,137 @@ void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics()
     oldEffectiveEnergy =
         returnReduce(oldEffectiveEnergy, sumOp<scalar>());
 
+    // ---------------------------------------------------------------
+    // Open-boundary advective energy transport
+    //
+    // Evaluate exactly the same separate finite-volume divergence forms used
+    // by the energy equation.  Their global volume integrals are the net
+    // outward advective powers through the physical boundary.
+    //
+    // Sensible:       div(U Cp T)
+    // Bulk latent:    div(L fs U)
+    // Relative latent div(L fs (U-us))
+    //
+    // The final residual uses +sensible -bulk +relative, matching TEqn.
+
+    const dimensionedScalar latentHeatDim
+    (
+        "latentHeat",
+        dimensionSet(0, 2, -2, 0, 0, 0, 0),
+        latentHeat_
+    );
+
+    const dimensionedVector solidVelocityDim
+    (
+        "solidVelocity",
+        dimLength/dimTime,
+        solidVelocity_
+    );
+
+    const surfaceScalarField solidPhiEnergyAudit
+    (
+        IOobject
+        (
+            "solidVelocityFluxEnergyAuditTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        solidVelocityDim & mesh_.Sf()
+    );
+
+    const surfaceScalarField relativePhiEnergyAudit
+    (
+        IOobject
+        (
+            "relativeVelocityFluxEnergyAuditTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        phi_ - solidPhiEnergyAudit
+    );
+
+    const volScalarField CpTEnergyAudit
+    (
+        IOobject
+        (
+            "CpTEnergyAuditTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        CpMix_*T_
+    );
+
+    const tmp<volScalarField> tSensibleAdvectionAudit =
+        fvc::div(phi_, CpTEnergyAudit, "div(phi,T)");
+
+    const tmp<volScalarField> tBulkLatentAdvectionAudit =
+        latentHeatDim
+       *fvc::div
+        (
+            phi_,
+            fs_,
+            "div(phi,T)"
+        );
+
+    const tmp<volScalarField> tRelativeLatentAdvectionAudit =
+        latentHeatDim
+       *fvc::div
+        (
+            relativePhiEnergyAudit,
+            fs_,
+            "div(phi,T)"
+        );
+
+    const volScalarField& sensibleAdvectionAudit =
+        tSensibleAdvectionAudit();
+
+    const volScalarField& bulkLatentAdvectionAudit =
+        tBulkLatentAdvectionAudit();
+
+    const volScalarField& relativeLatentAdvectionAudit =
+        tRelativeLatentAdvectionAudit();
+
+    scalar sensibleAdvectionPower = 0.0;
+    scalar bulkLatentAdvectionPower = 0.0;
+    scalar relativeLatentAdvectionPower = 0.0;
+
+    forAll(T_, celli)
+    {
+        sensibleAdvectionPower +=
+            rho_*sensibleAdvectionAudit[celli]*V[celli];
+
+        bulkLatentAdvectionPower +=
+            rho_*bulkLatentAdvectionAudit[celli]*V[celli];
+
+        relativeLatentAdvectionPower +=
+            rho_*relativeLatentAdvectionAudit[celli]*V[celli];
+    }
+
+    sensibleAdvectionPower =
+        returnReduce(sensibleAdvectionPower, sumOp<scalar>());
+
+    bulkLatentAdvectionPower =
+        returnReduce(bulkLatentAdvectionPower, sumOp<scalar>());
+
+    relativeLatentAdvectionPower =
+        returnReduce(relativeLatentAdvectionPower, sumOp<scalar>());
+
     scalar conductiveBoundaryPower = 0.0;
+
+    const tmp<volScalarField> tNutEnergyAudit =
+        momentumTransport->nut();
+
+    const volScalarField& nutEnergyAudit =
+        tNutEnergyAudit();
 
     forAll(mesh_.boundary(), patchi)
     {
@@ -1170,14 +1390,28 @@ void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics()
         const fvPatchScalarField& kp =
             kEff_.boundaryField()[patchi];
 
+        const fvPatchScalarField& fsp =
+            fs_.boundaryField()[patchi];
+
+        const fvPatchScalarField& nutp =
+            nutEnergyAudit.boundaryField()[patchi];
+
         const scalarField& magSf = patch.magSf();
 
         const scalarField snGradT(Tp.snGrad());
 
         forAll(snGradT, facei)
         {
+            const scalar flFace =
+                min(max(1.0 - fsp[facei], scalar(0)), scalar(1));
+
+            const scalar kTurbFace =
+                rho_*CpLiquid_*flFace
+               *max(nutp[facei], scalar(0))/Prt_;
+
             conductiveBoundaryPower +=
-                kp[facei]*snGradT[facei]*magSf[facei];
+                (kp[facei] + kTurbFace)
+               *snGradT[facei]*magSf[facei];
         }
     }
 
@@ -1188,7 +1422,11 @@ void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics()
         (effectiveEnergy - oldEffectiveEnergy)/deltaTValue;
 
     const scalar balanceResidual =
-        effectiveEnergyRate - conductiveBoundaryPower;
+        effectiveEnergyRate
+      + sensibleAdvectionPower
+      - bulkLatentAdvectionPower
+      + relativeLatentAdvectionPower
+      - conductiveBoundaryPower;
 
     const scalar balanceScale =
         max
@@ -1196,7 +1434,19 @@ void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics()
             max
             (
                 mag(effectiveEnergyRate),
-                mag(conductiveBoundaryPower)
+                max
+                (
+                    mag(sensibleAdvectionPower),
+                    max
+                    (
+                        mag(bulkLatentAdvectionPower),
+                        max
+                        (
+                            mag(relativeLatentAdvectionPower),
+                            mag(conductiveBoundaryPower)
+                        )
+                    )
+                )
             ),
             SMALL
         );
@@ -1204,7 +1454,7 @@ void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics()
     const scalar relativeBalanceResidual =
         balanceResidual/balanceScale;
 
-    Info<< "Global energy-conservation audit" << nl
+    Info<< "Post-solve field energy balance" << nl
         << "    sensible energy             = "
         << sensibleEnergy << " J" << nl
         << "    latent reference rho*L*fs  = "
@@ -1215,7 +1465,13 @@ void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics()
         << oldEffectiveEnergy << " J" << nl
         << "    dE*/dt                     = "
         << effectiveEnergyRate << " W" << nl
-        << "    boundary integral k*dT/dn  = "
+        << "    sensible advective power   = "
+        << sensibleAdvectionPower << " W" << nl
+        << "    bulk latent advective power= "
+        << bulkLatentAdvectionPower << " W" << nl
+        << "    relative latent adv. power = "
+        << relativeLatentAdvectionPower << " W" << nl
+        << "    boundary integral kEffTot*dT/dn = "
         << conductiveBoundaryPower << " W" << nl
         << "    energy balance residual    = "
         << balanceResidual << " W" << nl
@@ -1302,6 +1558,22 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
     muLiquid_(alloyProperties_.lookup<scalar>("muLiquid")),
     DL_(alloyProperties_.lookup<scalar>("DL")),
     DS_(alloyProperties_.lookup<scalar>("DS")),
+    Prt_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "Prt",
+            0.9
+        )
+    ),
+    Sct_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "Sct",
+            1.0
+        )
+    ),
     betaT_(alloyProperties_.lookup<scalar>("betaT")),
     betaC_(alloyProperties_.lookup<scalar>("betaC")),
     TRef_(alloyProperties_.lookup<scalar>("TRef")),
@@ -1676,7 +1948,8 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << "    solidVelocity     = " << solidVelocity_ << " m/s" << nl
         << "    |solidVelocity|   = " << mag(solidVelocity_) << " m/s" << nl
         << "    CC-2 coupling     = moving-solid BKC momentum" << nl
-        << "    pending           = species (CC-3), energy (CC-4)"
+        << "    CC-3 coupling     = moving-solid relative species transport" << nl
+        << "    CC-4 coupling     = moving-solid latent-energy transport"
         << endl;
 
     Info<< "continuousCastingMacrosegregation: alloy properties" << nl
@@ -1696,6 +1969,8 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << "    muLiquid        = " << muLiquid_ << " Pa s" << nl
         << "    DL              = " << DL_ << " m2/s" << nl
         << "    DS              = " << DS_ << " m2/s" << nl
+        << "    Prt             = " << Prt_ << nl
+        << "    Sct             = " << Sct_ << nl
         << "    betaT           = " << betaT_ << " 1/K" << nl
         << "    betaC           = " << betaC_
         << " 1/(solute mass fraction)" << nl
@@ -1907,11 +2182,46 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         phi_ - solidPhi
     );
 
+    const tmp<volScalarField> tNutEnergy =
+        momentumTransport->nut();
+
+    const volScalarField& nutEnergy =
+        tNutEnergy();
+
+    const volScalarField liquidFractionEnergy
+    (
+        IOobject
+        (
+            "liquidFractionEnergyTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        scalar(1) - fs_
+    );
+
+    const dimensionedScalar CpLiquidDim
+    (
+        "CpLiquid",
+        dimensionSet(0, 2, -2, -1, 0, 0, 0),
+        CpLiquid_
+    );
+
     Info<< "Solidification/variable-property energy coupling" << nl
         << "    Eq. (13) sensible advection = direct CpMix*T product" << nl
         << "    CC-4 latent advection       = term-by-term" << nl
         << "    bulk latent flux            = phi" << nl
         << "    relative latent flux        = phi - phiSolid" << nl
+        << "    CC-8 turbulent heat         = fl*CpLiquid*nut/Prt" << nl
+        << "    Prt                          = " << Prt_ << nl
+        << "    nut min/max                  = "
+        << gMin(nutEnergy.primitiveField()) << " "
+        << gMax(nutEnergy.primitiveField()) << " m2/s" << nl
+        << "    alphaT=nut/Prt min/max       = "
+        << gMin(nutEnergy.primitiveField())/Prt_ << " "
+        << gMax(nutEnergy.primitiveField())/Prt_ << " m2/s" << nl
         << "    solidVelocity               = "
         << solidVelocity_ << " m/s" << nl
         << "    loops = " << nSolidificationLoops_
@@ -1923,9 +2233,15 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         const tmp<volScalarField> tLatentCp =
             -latentHeatDim*dfsdT_;
 
-        // Effective conductivity term after dividing Eq. (13) by rho.
+        // Effective heat-diffusion coefficient after dividing Eq. (13)
+        // by rho.  CC-8 adds turbulent heat transport only in the liquid:
+        //
+        //   kEff/rho + fl*CpLiquid*nut/Prt.
+        //
+        // For laminar models nut=0, so this reduces exactly to CC-7.
         const tmp<volScalarField> tKbyRho =
-            kEff_/rhoDim;
+            kEff_/rhoDim
+          + liquidFractionEnergy*CpLiquidDim*nutEnergy/Prt_;
 
         // CC-4 latent-energy advection terms are discretized separately.
         //

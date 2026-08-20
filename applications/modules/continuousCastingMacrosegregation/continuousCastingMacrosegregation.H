@@ -34,7 +34,11 @@ Description
         implicit Darcy damping toward the prescribed solid velocity;
       - Bennon-Incropera mixture species transport, discretized term-by-term
         as written in Eq. (19), with moving-solid relative advection based on
-        U-us.
+        U-us;
+      - CC-8 turbulence-consistent heat and species transport using the
+        momentum-model turbulent kinematic viscosity, with Prt and Sct read
+        from constant/alloyProperties. Turbulent scalar transport is applied
+        only to the liquid fraction.
 
     Hybrid-model terms are added in later validation stages.
 
@@ -131,6 +135,12 @@ protected:
         //- Solid solute diffusivity [m2/s]
         scalar DS_;
 
+        //- Turbulent Prandtl number for liquid-phase heat transport
+        scalar Prt_;
+
+        //- Turbulent Schmidt number for liquid-phase species transport
+        scalar Sct_;
+
         //- Thermal expansion coefficient [1/K]
         scalar betaT_;
 
@@ -174,8 +184,13 @@ protected:
         //- Solid-phase solute mass fraction
         volScalarField CarbonS_;
 
-        //- Mixture solute diffusivity
-        //    D = fs*DS + (1-fs)*DL
+        //- Effective mixture solute diffusivity used by the implicit
+        //  mixture-C diffusion operator:
+        //
+        //    Dmix = fs*DS + fl*(DL + nut/Sct)
+        //
+        //  The accompanying explicit liquid/solid correction operators keep
+        //  the final diffusion flux phase-separated.
         //  [m2/s]
         volScalarField speciesDiffusivity_;
 
