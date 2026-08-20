@@ -32,8 +32,9 @@ Description
       - thermo-solutal Boussinesq buoyancy in momentum;
       - standard Blake-Kozeny-Carman (BKC) mushy-zone permeability and
         implicit Darcy damping toward the prescribed solid velocity;
-      - Bennon-Incropera mixture species transport for the standard-BKC
-        benchmark, discretized term-by-term as written in Eq. (19).
+      - Bennon-Incropera mixture species transport, discretized term-by-term
+        as written in Eq. (19), with moving-solid relative advection based on
+        U-us.
 
     Hybrid-model terms are added in later validation stages.
 
@@ -304,7 +305,8 @@ protected:
         //  optionally, print the global solute-conservation audit.
         void updateSpeciesDiagnostics(const bool report);
 
-        //- Solve the standard-BKC Bennon-Incropera mixture species equation.
+        //- Solve the Bennon-Incropera mixture species equation with the
+        //  moving-solid relative-advection term based on U-us.
         //  Returns the global maximum change in Carbon during this correction.
         scalar solveSpeciesTransport();
 

@@ -911,7 +911,9 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
     //   + div(fs Ds grad(Cs-C))
     //   - div((U-us)(Cl-C)).
     //
-    // For the AFRODITE standard-BKC model us = 0.
+    // For moving solid, us is the prescribed uniform solidVelocity_.
+    // The bulk mixture advection remains based on U/phi; only the explicit
+    // relative phase-advection term uses U-us.
     //
     // IMPORTANT v9 CHANGE
     // -------------------
@@ -923,8 +925,8 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
     // bounded linear-upwind interpolation. v9 therefore discretizes Eq. (19)
     // term-by-term, following the published equation directly:
     //
-    //   + div(U C)              : implicit in Carbon
-    //   - div(U (Cl-C))         : explicit RHS correction
+    //   + div(U C)                    : implicit in Carbon
+    //   - div((U-us) (Cl-C))           : explicit RHS correction
     //
     // The mixture diffusion term is implicit. The liquid/solid
     // phase-difference diffusion terms remain explicit. For the published
@@ -960,8 +962,50 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
         scalar(1) - fs_
     );
 
+    // Uniform solid-velocity face flux and liquid-solid relative flux.
+    //
+    //   phi_s   = us . Sf
+    //   phi_rel = phi - phi_s
+    //
+    // This changes only the final relative-advection term of Eq. (19).
+    // The primary mixture advection term div(U C) continues to use phi_.
+    const dimensionedVector solidVelocityDim
+    (
+        "solidVelocity",
+        dimLength/dimTime,
+        solidVelocity_
+    );
+
+    const surfaceScalarField solidPhi
+    (
+        IOobject
+        (
+            "solidVelocityFluxTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        solidVelocityDim & mesh_.Sf()
+    );
+
+    const surfaceScalarField relativePhi
+    (
+        IOobject
+        (
+            "relativeVelocityFluxTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        phi_ - solidPhi
+    );
+
     // Explicit relative-composition field appearing in the final advective
-    // term of Eq. (19). For standard BKC us=0.
+    // term of Eq. (19).
     const volScalarField relativeLiquidComposition
     (
         IOobject
@@ -996,7 +1040,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
         )
       - fvc::div
         (
-            phi_,
+            relativePhi,
             relativeLiquidComposition,
             "div(phi,Carbon)"
         )
