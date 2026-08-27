@@ -96,6 +96,26 @@ protected:
         //- Binary-alloy material-property dictionary
         IOdictionary alloyProperties_;
 
+        //- Optional runtime controls for custom diagnostic output
+        //  read from constant/diagnosticsProperties
+        IOdictionary diagnosticsProperties_;
+
+        //- Experimental pseudo-steady continuation controls
+        IOdictionary pseudoSteadyProperties_;
+        bool pseudoSteadyEnabled_;
+        scalar pseudoMinDeltaT_;
+        scalar pseudoMaxDeltaT_;
+        scalar pseudoMaxCo_;
+        scalar pseudoGrowthFactor_;
+        scalar pseudoShrinkFactor_;
+        scalar pseudoGrowthThreshold_;
+        scalar pseudoMaxDeltaTStep_;
+        scalar pseudoMaxDeltaCarbonStep_;
+        scalar pseudoMaxDeltaFsStep_;
+        scalar pseudoMaxDeltaUStep_;
+        mutable scalar pseudoDeltaTTarget_;
+        label pseudoReportInterval_;
+
         //- Reference/constant density [kg/m3]
         scalar rho_;
 
@@ -298,6 +318,16 @@ protected:
         //- Validate the alloy-property dictionary
         void validateAlloyProperties() const;
 
+        //- Return true when the named diagnostic is enabled for the
+        //  current time index according to constant/diagnosticsProperties
+        bool diagnosticEnabled(const word& name) const;
+
+        //- Validate experimental pseudo-steady controls
+        void validatePseudoSteadyProperties() const;
+
+        //- Update the target for the next pseudo time step
+        void updatePseudoSteadyControl();
+
         //- Update Lever-rule phase equilibrium:
         //    Tliq = Tmelt + mliq*C
         //    Tsol = Tmelt + mliq*C/kp
@@ -322,8 +352,20 @@ protected:
 
         //- Solve the Bennon-Incropera mixture species equation with the
         //  moving-solid relative-advection term based on U-us.
+        //  If report=true, print the CC-9 open-domain/discrete species audit
+        //  immediately after the solve, before phase-state re-closure changes
+        //  CarbonL/CarbonS or the frozen diffusion coefficients.
         //  Returns the global maximum change in Carbon during this correction.
-        scalar solveSpeciesTransport();
+        scalar solveSpeciesTransport(const bool report);
+
+        //- Diagnose the relative contribution of temperature and mixture
+        //  composition changes to Lever-rule solid-fraction evolution:
+        //
+        //    dfs/dt = (dfs/dT)_C dT/dt + (dfs/dC)_T dC/dt
+        //
+        //  Enabled explicitly with `phaseCoupling true;` in
+        //  constant/diagnosticsProperties.
+        void updatePhaseCouplingDiagnostics() const;
 
         //- Print a global Eq. (13) energy-conservation audit.
         //
@@ -417,6 +459,10 @@ public:
 
 
     // Member Functions
+
+        //- Return the current maximum time-step. In pseudo-steady mode the
+        //  pseudoSteadyProperties Courant ceiling is used.
+        virtual scalar maxDeltaT() const;
 
         //- Called at the start of the time-step, before the PIMPLE loop
         virtual void preSolve();

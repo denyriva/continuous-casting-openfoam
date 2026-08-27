@@ -51,6 +51,207 @@ void Foam::solvers::continuousCastingMacrosegregation::continuityErrors()
 }
 
 
+Foam::scalar
+Foam::solvers::continuousCastingMacrosegregation::maxDeltaT() const
+{
+    if (!pseudoSteadyEnabled_)
+    {
+        return basicFluidSolver::maxDeltaT();
+    }
+
+    scalar deltaT =
+        min
+        (
+            fvModels().maxDeltaT(),
+            min(pseudoDeltaTTarget_, pseudoMaxDeltaT_)
+        );
+
+    if (pseudoMaxCo_ < vGreat && CoNum > small)
+    {
+        deltaT =
+            min
+            (
+                deltaT,
+                pseudoMaxCo_/CoNum*runTime.deltaTValue()
+            );
+    }
+
+    return deltaT;
+}
+
+
+void
+Foam::solvers::continuousCastingMacrosegregation::
+validatePseudoSteadyProperties() const
+{
+    if (!pseudoSteadyEnabled_) return;
+
+    if (pseudoMinDeltaT_ <= SMALL || pseudoMaxDeltaT_ < pseudoMinDeltaT_)
+    {
+        FatalIOErrorInFunction(pseudoSteadyProperties_)
+            << "Require 0 < minDeltaT <= maxDeltaT."
+            << exit(FatalIOError);
+    }
+
+    if (pseudoMaxCo_ <= SMALL)
+    {
+        FatalIOErrorInFunction(pseudoSteadyProperties_)
+            << "maxCo must be > 0." << exit(FatalIOError);
+    }
+
+    if (pseudoGrowthFactor_ <= 1.0)
+    {
+        FatalIOErrorInFunction(pseudoSteadyProperties_)
+            << "growthFactor must be > 1." << exit(FatalIOError);
+    }
+
+    if (pseudoShrinkFactor_ <= 0.0 || pseudoShrinkFactor_ >= 1.0)
+    {
+        FatalIOErrorInFunction(pseudoSteadyProperties_)
+            << "Require 0 < shrinkFactor < 1." << exit(FatalIOError);
+    }
+
+    if (pseudoGrowthThreshold_ <= 0.0 || pseudoGrowthThreshold_ >= 1.0)
+    {
+        FatalIOErrorInFunction(pseudoSteadyProperties_)
+            << "Require 0 < growthThreshold < 1." << exit(FatalIOError);
+    }
+
+    if
+    (
+        pseudoMaxDeltaTStep_ <= SMALL
+     || pseudoMaxDeltaCarbonStep_ <= SMALL
+     || pseudoMaxDeltaFsStep_ <= SMALL
+     || pseudoMaxDeltaUStep_ <= SMALL
+    )
+    {
+        FatalIOErrorInFunction(pseudoSteadyProperties_)
+            << "All per-step change limits must be > 0."
+            << exit(FatalIOError);
+    }
+
+    if (pseudoReportInterval_ < 1)
+    {
+        FatalIOErrorInFunction(pseudoSteadyProperties_)
+            << "reportInterval must be >= 1."
+            << exit(FatalIOError);
+    }
+}
+
+
+void
+Foam::solvers::continuousCastingMacrosegregation::
+updatePseudoSteadyControl()
+{
+    if (!pseudoSteadyEnabled_) return;
+
+    scalar dTmax=0, dCmax=0, dfsmax=0, dUmax=0;
+
+    const volScalarField& TOld=T_.oldTime();
+    const volScalarField& COld=Carbon_.oldTime();
+    const volScalarField& fsOld=fs_.oldTime();
+    const volVectorField& UOld=U_.oldTime();
+
+    forAll(T_, celli)
+    {
+        dTmax=max(dTmax, mag(T_[celli]-TOld[celli]));
+        dCmax=max(dCmax, mag(Carbon_[celli]-COld[celli]));
+        dfsmax=max(dfsmax, mag(fs_[celli]-fsOld[celli]));
+        dUmax=max(dUmax, mag(U_[celli]-UOld[celli]));
+    }
+
+    dTmax=returnReduce(dTmax,maxOp<scalar>());
+    dCmax=returnReduce(dCmax,maxOp<scalar>());
+    dfsmax=returnReduce(dfsmax,maxOp<scalar>());
+    dUmax=returnReduce(dUmax,maxOp<scalar>());
+
+    const scalar severity =
+        max
+        (
+            dTmax/pseudoMaxDeltaTStep_,
+            max
+            (
+                dCmax/pseudoMaxDeltaCarbonStep_,
+                max(dfsmax/pseudoMaxDeltaFsStep_, dUmax/pseudoMaxDeltaUStep_)
+            )
+        );
+
+    const scalar dt=runTime.deltaTValue();
+    word action("hold");
+
+    if (severity > 1.0)
+    {
+        pseudoDeltaTTarget_=max(pseudoMinDeltaT_,dt*pseudoShrinkFactor_);
+        action="shrink";
+    }
+    else if (severity < pseudoGrowthThreshold_)
+    {
+        pseudoDeltaTTarget_=
+            min(pseudoMaxDeltaT_,max(pseudoMinDeltaT_,dt*pseudoGrowthFactor_));
+        action="grow";
+    }
+    else
+    {
+        pseudoDeltaTTarget_=min(pseudoMaxDeltaT_,max(pseudoMinDeltaT_,dt));
+    }
+
+    if (action=="shrink" || runTime.timeIndex()%pseudoReportInterval_==0)
+    {
+        Info<< "Pseudo-steady continuation" << nl
+            << "    pseudo time         = " << runTime.value() << " s" << nl
+            << "    current deltaT      = " << dt << " s" << nl
+            << "    next target deltaT  = " << pseudoDeltaTTarget_ << " s" << nl
+            << "    max |delta T|       = " << dTmax << " K" << nl
+            << "    max |delta Carbon|  = " << dCmax << nl
+            << "    max |delta fs|      = " << dfsmax << nl
+            << "    max |delta U|       = " << dUmax << " m/s" << nl
+            << "    severity            = " << severity << nl
+            << "    action              = " << action << endl;
+    }
+}
+
+
+bool Foam::solvers::continuousCastingMacrosegregation::diagnosticEnabled
+(
+    const word& name
+) const
+{
+    if
+    (
+        !diagnosticsProperties_.lookupOrDefault<Switch>
+        (
+            "enabled",
+            true
+        )
+    )
+    {
+        return false;
+    }
+
+    const label interval =
+        max
+        (
+            diagnosticsProperties_.lookupOrDefault<label>
+            (
+                "interval",
+                1
+            ),
+            label(1)
+        );
+
+    if (runTime.timeIndex() % interval != 0)
+    {
+        return false;
+    }
+
+    return diagnosticsProperties_.lookupOrDefault<Switch>
+    (
+        name,
+        true
+    );
+}
+
+
 void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties() const
 {
     if (rho_ <= SMALL)
@@ -437,7 +638,7 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
     nMushy = returnReduce(nMushy, sumOp<label>());
     nSolid = returnReduce(nSolid, sumOp<label>());
 
-    if (report)
+    if (report && diagnosticEnabled("phaseState"))
     {
         Info<< "Lever-rule phase-state audit" << nl
             << "    T min/max             = "
@@ -528,6 +729,11 @@ void Foam::solvers::continuousCastingMacrosegregation::updateBuoyancy()
     buoyancyThermal_.correctBoundaryConditions();
     buoyancySolutal_.correctBoundaryConditions();
     buoyancyTotal_.correctBoundaryConditions();
+
+    if (!diagnosticEnabled("buoyancy"))
+    {
+        return;
+    }
 
     scalar minDeltaT = GREAT;
     scalar maxDeltaT = -GREAT;
@@ -723,7 +929,7 @@ void Foam::solvers::continuousCastingMacrosegregation::updateBKCDrag
     bkcDragCoeff_.correctBoundaryConditions();
     bkcDragAcceleration_.correctBoundaryConditions();
 
-    if (!report)
+    if (!report || !diagnosticEnabled("permeability"))
     {
         return;
     }
@@ -880,7 +1086,7 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
     liquidAdvectionFactor_.correctBoundaryConditions();
     macrosegregation_.correctBoundaryConditions();
 
-    if (!report)
+    if (!report || !diagnosticEnabled("transport"))
     {
         return;
     }
@@ -953,7 +1159,10 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
 
 
 Foam::scalar
-Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
+Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
+(
+    const bool report
+)
 {
     // Bennon-Incropera mixture species equation used by the paper, Eq. (19):
     //
@@ -1126,6 +1335,228 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
 
     CarbonEqn.solve();
 
+    // -----------------------------------------------------------------
+    // CC-9 open-domain species-conservation audit -- DIAGNOSTIC ONLY
+    //
+    // This is evaluated immediately after the Carbon solve and before
+    // updatePhaseState() changes fs, CarbonL or CarbonS. Therefore the
+    // explicit phase-difference diffusion and relative-advection fields are
+    // the same frozen fields that entered CarbonEqn.
+    //
+    // Bringing the implemented equation to the left-hand side gives:
+    //
+    //   dC/dt
+    // + div(phi C)
+    // - laplacian(DmixEff,C)
+    // - laplacian(fl DlEff,Cl-C)
+    // - laplacian(fs Ds,Cs-C)
+    // + div(phiRel,Cl-C)
+    // = 0.
+    //
+    // Multiplication by rho*V and global summation gives kg/s of solute.
+    // Unlike the historical "relative inventory err", this balance remains
+    // meaningful in an open caster because inlet/outlet transport is included
+    // through the divergence/laplacian operators.
+    //
+    // The implicit advection/diffusion operators are reconstructed explicitly
+    // with the converged Carbon field. With bounded higher-order advection,
+    // a small reconstruction lag can remain because the matrix correction was
+    // assembled from the pre-solve iterate. The reported balance therefore
+    // checks conservation of the solved open-domain equation, while the
+    // historical inventory-from-initial-state metric is retained only as a
+    // state diagnostic.
+
+    if (report && diagnosticEnabled("species"))
+    {
+        // CC-9 validation cases use first-order Euler time integration.
+        // Foundation v14 does not provide fvc::ddt(volScalarField), so
+        // reconstruct the Euler storage term explicitly from the current
+        // time-step size.
+        const scalar rDeltaTSpecies =
+            1.0/runTime.deltaTValue();
+
+        const volScalarField speciesStorage
+        (
+            IOobject
+            (
+                "speciesStorageAuditTmp",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE,
+                false
+            ),
+            rDeltaTSpecies*(Carbon_ - Carbon_.oldTime())
+        );
+
+        const tmp<volScalarField> tBulkSpeciesAdvection =
+            fvc::div(phi_, Carbon_, "div(phi,Carbon)");
+
+        const tmp<volScalarField> tMixtureSpeciesDiffusion =
+            fvc::laplacian(speciesDiffusivity_, Carbon_);
+
+        const tmp<volScalarField> tLiquidSpeciesCorrection =
+            fvc::laplacian
+            (
+                liquidFraction*effectiveLiquidDiffusivity,
+                CarbonL_ - Carbon_
+            );
+
+        const tmp<volScalarField> tSolidSpeciesCorrection =
+            fvc::laplacian
+            (
+                fs_*DSDim,
+                CarbonS_ - Carbon_
+            );
+
+        const tmp<volScalarField> tRelativeSpeciesAdvection =
+            fvc::div
+            (
+                relativePhi,
+                relativeLiquidComposition,
+                "div(phi,Carbon)"
+            );
+
+        const volScalarField& bulkSpeciesAdvection =
+            tBulkSpeciesAdvection();
+
+        const volScalarField& mixtureSpeciesDiffusion =
+            tMixtureSpeciesDiffusion();
+
+        const volScalarField& liquidSpeciesCorrection =
+            tLiquidSpeciesCorrection();
+
+        const volScalarField& solidSpeciesCorrection =
+            tSolidSpeciesCorrection();
+
+        const volScalarField& relativeSpeciesAdvection =
+            tRelativeSpeciesAdvection();
+
+        scalar storageRate = 0.0;
+        scalar bulkAdvectionRate = 0.0;
+        scalar mixtureDiffusionRate = 0.0;
+        scalar liquidCorrectionRate = 0.0;
+        scalar solidCorrectionRate = 0.0;
+        scalar relativeAdvectionRate = 0.0;
+        scalar residualRate = 0.0;
+
+        scalar maxResidualPerVolume = 0.0;
+
+        const scalarField& V = mesh_.V();
+
+        forAll(Carbon_, celli)
+        {
+            const scalar rhoV = rho_*V[celli];
+
+            storageRate +=
+                rhoV*speciesStorage[celli];
+
+            bulkAdvectionRate +=
+                rhoV*bulkSpeciesAdvection[celli];
+
+            mixtureDiffusionRate +=
+                rhoV*mixtureSpeciesDiffusion[celli];
+
+            liquidCorrectionRate +=
+                rhoV*liquidSpeciesCorrection[celli];
+
+            solidCorrectionRate +=
+                rhoV*solidSpeciesCorrection[celli];
+
+            relativeAdvectionRate +=
+                rhoV*relativeSpeciesAdvection[celli];
+
+            const scalar cellResidual =
+                speciesStorage[celli]
+              + bulkSpeciesAdvection[celli]
+              - mixtureSpeciesDiffusion[celli]
+              - liquidSpeciesCorrection[celli]
+              - solidSpeciesCorrection[celli]
+              + relativeSpeciesAdvection[celli];
+
+            residualRate +=
+                rhoV*cellResidual;
+
+            maxResidualPerVolume =
+                max(maxResidualPerVolume, mag(rho_*cellResidual));
+        }
+
+        storageRate =
+            returnReduce(storageRate, sumOp<scalar>());
+
+        bulkAdvectionRate =
+            returnReduce(bulkAdvectionRate, sumOp<scalar>());
+
+        mixtureDiffusionRate =
+            returnReduce(mixtureDiffusionRate, sumOp<scalar>());
+
+        liquidCorrectionRate =
+            returnReduce(liquidCorrectionRate, sumOp<scalar>());
+
+        solidCorrectionRate =
+            returnReduce(solidCorrectionRate, sumOp<scalar>());
+
+        relativeAdvectionRate =
+            returnReduce(relativeAdvectionRate, sumOp<scalar>());
+
+        residualRate =
+            returnReduce(residualRate, sumOp<scalar>());
+
+        maxResidualPerVolume =
+            returnReduce(maxResidualPerVolume, maxOp<scalar>());
+
+        const scalar balanceScale =
+            max
+            (
+                max
+                (
+                    mag(storageRate),
+                    mag(bulkAdvectionRate)
+                ),
+                max
+                (
+                    max
+                    (
+                        mag(mixtureDiffusionRate),
+                        mag(liquidCorrectionRate)
+                    ),
+                    max
+                    (
+                        max
+                        (
+                            mag(solidCorrectionRate),
+                            mag(relativeAdvectionRate)
+                        ),
+                        SMALL
+                    )
+                )
+            );
+
+        const scalar relativeResidual =
+            residualRate/balanceScale;
+
+        Info<< "Open-domain species conservation audit (CC-9)" << nl
+            << "    storage d(rho*C)/dt      = "
+            << storageRate << " kg/s" << nl
+            << "    bulk advective term      = "
+            << bulkAdvectionRate << " kg/s" << nl
+            << "    mixture diffusion term   = "
+            << mixtureDiffusionRate << " kg/s" << nl
+            << "    liquid correction term   = "
+            << liquidCorrectionRate << " kg/s" << nl
+            << "    solid correction term    = "
+            << solidCorrectionRate << " kg/s" << nl
+            << "    relative advective term  = "
+            << relativeAdvectionRate << " kg/s" << nl
+            << "    signed balance residual  = "
+            << residualRate << " kg/s" << nl
+            << "    relative balance residual= "
+            << relativeResidual << nl
+            << "    max |cell residual|      = "
+            << maxResidualPerVolume << " kg/(m3 s)"
+            << endl;
+    }
+
     scalar maxDeltaCarbon = 0.0;
 
     forAll(Carbon_, celli)
@@ -1145,8 +1576,186 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport()
 }
 
 
+void Foam::solvers::continuousCastingMacrosegregation::updatePhaseCouplingDiagnostics() const
+{
+    // Diagnostic only: quantify the two chain-rule contributions to the
+    // evolution of the Lever-rule solid fraction. No solved equation or
+    // field is modified here.
+    //
+    // In the mushy interval,
+    //
+    //   fs = (T - Tmelt - m*C)/[(1-kp)(T-Tmelt)]
+    //
+    // therefore
+    //
+    //   (dfs/dT)_C = m*C/[(1-kp)(T-Tmelt)^2]
+    //   (dfs/dC)_T = -m/[(1-kp)(T-Tmelt)].
+
+    // Keep this diagnostic opt-in. diagnosticEnabled() intentionally
+    // defaults unknown switches to true, so require the explicit key too.
+    if
+    (
+        !diagnosticsProperties_.lookupOrDefault<Switch>
+        (
+            "phaseCoupling",
+            false
+        )
+     || !diagnosticEnabled("phaseCoupling")
+    )
+    {
+        return;
+    }
+
+    const scalar dt = runTime.deltaTValue();
+
+    if (dt <= SMALL)
+    {
+        FatalErrorInFunction
+            << "Non-positive time step in phase-coupling diagnostic: "
+            << dt << abort(FatalError);
+    }
+
+    const volScalarField& TOld = T_.oldTime();
+    const volScalarField& COld = Carbon_.oldTime();
+    const scalarField& V = mesh_.V();
+
+    scalar totalVolume = 0.0;
+    scalar mushyVolume = 0.0;
+    scalar compositionDominantVolume = 0.0;
+
+    scalar thermalAbsIntegral = 0.0;
+    scalar compositionAbsIntegral = 0.0;
+    scalar combinedAbsIntegral = 0.0;
+
+    scalar maxThermalRate = 0.0;
+    scalar maxCompositionRate = 0.0;
+    scalar maxCombinedRate = 0.0;
+
+    forAll(T_, celli)
+    {
+        totalVolume += V[celli];
+
+        const scalar Tcell = T_[celli];
+        const scalar Ccell =
+            min(max(Carbon_[celli], scalar(0)), scalar(1));
+
+        const scalar Tliq = Tmelt_ + liquidusSlope_*Ccell;
+        const scalar Tsol = Tmelt_ + liquidusSlope_*Ccell/kp_;
+
+        // The analytical Lever derivatives below apply only strictly inside
+        // the current mushy interval. Fully liquid/solid cells are skipped.
+        if (Tcell >= Tliq || Tcell <= Tsol)
+        {
+            continue;
+        }
+
+        const scalar dTToMelt = Tcell - Tmelt_;
+        const scalar oneMinusKp = 1.0 - kp_;
+
+        if (mag(dTToMelt) <= SMALL || mag(oneMinusKp) <= SMALL)
+        {
+            continue;
+        }
+
+        const scalar dfsdT =
+            liquidusSlope_*Ccell
+           /(oneMinusKp*sqr(dTToMelt));
+
+        const scalar dfsdC =
+            -liquidusSlope_
+           /(oneMinusKp*dTToMelt);
+
+        const scalar thermalRate =
+            dfsdT*(T_[celli] - TOld[celli])/dt;
+
+        const scalar compositionRate =
+            dfsdC*(Carbon_[celli] - COld[celli])/dt;
+
+        const scalar combinedRate = thermalRate + compositionRate;
+
+        const scalar aThermal = mag(thermalRate);
+        const scalar aComposition = mag(compositionRate);
+        const scalar aCombined = mag(combinedRate);
+
+        mushyVolume += V[celli];
+        thermalAbsIntegral += aThermal*V[celli];
+        compositionAbsIntegral += aComposition*V[celli];
+        combinedAbsIntegral += aCombined*V[celli];
+
+        if (aComposition > aThermal)
+        {
+            compositionDominantVolume += V[celli];
+        }
+
+        maxThermalRate = max(maxThermalRate, aThermal);
+        maxCompositionRate = max(maxCompositionRate, aComposition);
+        maxCombinedRate = max(maxCombinedRate, aCombined);
+    }
+
+    totalVolume = returnReduce(totalVolume, sumOp<scalar>());
+    mushyVolume = returnReduce(mushyVolume, sumOp<scalar>());
+    compositionDominantVolume =
+        returnReduce(compositionDominantVolume, sumOp<scalar>());
+
+    thermalAbsIntegral =
+        returnReduce(thermalAbsIntegral, sumOp<scalar>());
+    compositionAbsIntegral =
+        returnReduce(compositionAbsIntegral, sumOp<scalar>());
+    combinedAbsIntegral =
+        returnReduce(combinedAbsIntegral, sumOp<scalar>());
+
+    maxThermalRate =
+        returnReduce(maxThermalRate, maxOp<scalar>());
+    maxCompositionRate =
+        returnReduce(maxCompositionRate, maxOp<scalar>());
+    maxCombinedRate =
+        returnReduce(maxCombinedRate, maxOp<scalar>());
+
+    const scalar meanThermalRate =
+        mushyVolume > SMALL ? thermalAbsIntegral/mushyVolume : 0.0;
+
+    const scalar meanCompositionRate =
+        mushyVolume > SMALL ? compositionAbsIntegral/mushyVolume : 0.0;
+
+    const scalar meanCombinedRate =
+        mushyVolume > SMALL ? combinedAbsIntegral/mushyVolume : 0.0;
+
+    const scalar compositionDominantFraction =
+        mushyVolume > SMALL
+      ? compositionDominantVolume/mushyVolume
+      : 0.0;
+
+    const scalar mushyVolumeFraction =
+        totalVolume > SMALL ? mushyVolume/totalVolume : 0.0;
+
+    Info<< "Lever-rule T/C phase-coupling diagnostic" << nl
+        << "    mushy volume fraction                 = "
+        << mushyVolumeFraction << nl
+        << "    max |(dfs/dT) dT/dt|                  = "
+        << maxThermalRate << " 1/s" << nl
+        << "    max |(dfs/dC) dC/dt|                  = "
+        << maxCompositionRate << " 1/s" << nl
+        << "    max |chain-rule dfs/dt|               = "
+        << maxCombinedRate << " 1/s" << nl
+        << "    mushy mean |thermal contribution|     = "
+        << meanThermalRate << " 1/s" << nl
+        << "    mushy mean |composition contribution| = "
+        << meanCompositionRate << " 1/s" << nl
+        << "    mushy mean |combined contribution|    = "
+        << meanCombinedRate << " 1/s" << nl
+        << "    mushy volume with |C term|>|T term|   = "
+        << compositionDominantFraction
+        << endl;
+}
+
+
 void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics() const
 {
+    if (!diagnosticEnabled("energy"))
+    {
+        return;
+    }
+
     // Global moving-solid Eq. (13) audit.
     //
     // The implemented energy equation is, after division by rho,
@@ -1545,6 +2154,44 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         )
     ),
 
+    diagnosticsProperties_
+    (
+        IOobject
+        (
+            "diagnosticsProperties",
+            runTime.constant(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::NO_WRITE
+        )
+    ),
+
+    pseudoSteadyProperties_
+    (
+        IOobject
+        (
+            "pseudoSteadyProperties",
+            runTime.constant(),
+            mesh,
+            IOobject::MUST_READ,
+            IOobject::NO_WRITE
+        )
+    ),
+
+    pseudoSteadyEnabled_(pseudoSteadyProperties_.lookupOrDefault<Switch>("enabled", false)),
+    pseudoMinDeltaT_(pseudoSteadyProperties_.lookupOrDefault<scalar>("minDeltaT", 1e-4)),
+    pseudoMaxDeltaT_(pseudoSteadyProperties_.lookupOrDefault<scalar>("maxDeltaT", 0.1)),
+    pseudoMaxCo_(pseudoSteadyProperties_.lookupOrDefault<scalar>("maxCo", 2.0)),
+    pseudoGrowthFactor_(pseudoSteadyProperties_.lookupOrDefault<scalar>("growthFactor", 1.2)),
+    pseudoShrinkFactor_(pseudoSteadyProperties_.lookupOrDefault<scalar>("shrinkFactor", 0.5)),
+    pseudoGrowthThreshold_(pseudoSteadyProperties_.lookupOrDefault<scalar>("growthThreshold", 0.35)),
+    pseudoMaxDeltaTStep_(pseudoSteadyProperties_.lookupOrDefault<scalar>("maxDeltaTStep", 2.0)),
+    pseudoMaxDeltaCarbonStep_(pseudoSteadyProperties_.lookupOrDefault<scalar>("maxDeltaCarbonStep", 1e-4)),
+    pseudoMaxDeltaFsStep_(pseudoSteadyProperties_.lookupOrDefault<scalar>("maxDeltaFsStep", 0.02)),
+    pseudoMaxDeltaUStep_(pseudoSteadyProperties_.lookupOrDefault<scalar>("maxDeltaUStep", 0.02)),
+    pseudoDeltaTTarget_(pseudoSteadyProperties_.lookupOrDefault<scalar>("initialDeltaT", runTime.deltaTValue())),
+    pseudoReportInterval_(pseudoSteadyProperties_.lookupOrDefault<label>("reportInterval", 100)),
+
     rho_(alloyProperties_.lookup<scalar>("rho")),
     CpLiquid_(alloyProperties_.lookup<scalar>("CpLiquid")),
     CpSolid_(alloyProperties_.lookup<scalar>("CpSolid")),
@@ -1923,6 +2570,22 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
     bkcDragAcceleration(bkcDragAcceleration_)
 {
     validateAlloyProperties();
+    validatePseudoSteadyProperties();
+
+    if (pseudoSteadyEnabled_)
+    {
+        pseudoDeltaTTarget_=
+            min(pseudoMaxDeltaT_,max(pseudoMinDeltaT_,pseudoDeltaTTarget_));
+
+        Info<< "continuousCastingMacrosegregation: EXPERIMENTAL pseudo-steady "
+            << "continuation ENABLED" << nl
+            << "    written runTime is pseudo-time, not physical time" << nl
+            << "    initial target deltaT = " << pseudoDeltaTTarget_ << " s" << nl
+            << "    min/max deltaT        = " << pseudoMinDeltaT_ << " "
+            << pseudoMaxDeltaT_ << " s" << nl
+            << "    pseudo maxCo          = " << pseudoMaxCo_ << endl;
+    }
+
     updatePhaseState(true);
     updateSpeciesDiagnostics(true);
 
@@ -2024,6 +2687,14 @@ Foam::solvers::continuousCastingMacrosegregation::~continuousCastingMacrosegrega
 
 void Foam::solvers::continuousCastingMacrosegregation::preSolve()
 {
+    if (pseudoSteadyEnabled_)
+    {
+        U_.oldTime();
+        T_.oldTime();
+        Carbon_.oldTime();
+        fs_.oldTime();
+    }
+
     if ((mesh.dynamic() || MRF.size()) && !Uf.valid())
     {
         Info<< "Constructing face momentum Uf" << endl;
@@ -2209,7 +2880,12 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         CpLiquid_
     );
 
-    Info<< "Solidification/variable-property energy coupling" << nl
+    const bool energyDiagnosticsNow =
+        diagnosticEnabled("energy");
+
+    if (energyDiagnosticsNow)
+    {
+        Info<< "Solidification/variable-property energy coupling" << nl
         << "    Eq. (13) sensible advection = direct CpMix*T product" << nl
         << "    CC-4 latent advection       = term-by-term" << nl
         << "    bulk latent flux            = phi" << nl
@@ -2224,8 +2900,9 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         << gMax(nutEnergy.primitiveField())/Prt_ << " m2/s" << nl
         << "    solidVelocity               = "
         << solidVelocity_ << " m/s" << nl
-        << "    loops = " << nSolidificationLoops_
-        << endl;
+            << "    loops = " << nSolidificationLoops_
+            << endl;
+    }
 
     for (label corr = 0; corr < nSolidificationLoops_; ++corr)
     {
@@ -2324,25 +3001,28 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 
         scalar maxEnergyAdvectionCorrection = 0.0;
 
-        const volScalarField& energyAdvectionCorrection =
-            tEnergyAdvectionCorrection();
-
-        forAll(energyAdvectionCorrection, celli)
+        if (energyDiagnosticsNow)
         {
+            const volScalarField& energyAdvectionCorrection =
+                tEnergyAdvectionCorrection();
+
+            forAll(energyAdvectionCorrection, celli)
+            {
+                maxEnergyAdvectionCorrection =
+                    max
+                    (
+                        maxEnergyAdvectionCorrection,
+                        mag(energyAdvectionCorrection[celli])
+                    );
+            }
+
             maxEnergyAdvectionCorrection =
-                max
+                returnReduce
                 (
                     maxEnergyAdvectionCorrection,
-                    mag(energyAdvectionCorrection[celli])
+                    maxOp<scalar>()
                 );
         }
-
-        maxEnergyAdvectionCorrection =
-            returnReduce
-            (
-                maxEnergyAdvectionCorrection,
-                maxOp<scalar>()
-            );
 
         const scalarField TBefore(T_.primitiveField());
 
@@ -2387,7 +3067,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         const bool finalThermalCorrection =
             corr == nSolidificationLoops_ - 1;
 
-        if (finalThermalCorrection)
+        if (finalThermalCorrection && energyDiagnosticsNow)
         {
             // Foundation v14 has no fvc::ddt(CpMix_, T_) overload.
             // For this fixed mesh with Euler time integration, the explicit
@@ -2670,14 +3350,16 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             updatePhaseState(false);
 
         // Solve mixture solute conservation. This changes Carbon and hence
-        // the local liquidus/solidus and phase compositions.
-        const scalar maxDeltaCarbon =
-            solveSpeciesTransport();
-
-        // Re-close the phase equilibrium after the Carbon correction.
+        // the local liquidus/solidus and phase compositions. On the final
+        // correction, audit the open-domain species balance immediately after
+        // the solve and before phase-state re-closure changes the frozen fields.
         const bool finalLoop =
             corr == nSolidificationLoops_ - 1;
 
+        const scalar maxDeltaCarbon =
+            solveSpeciesTransport(finalLoop);
+
+        // Re-close the phase equilibrium after the Carbon correction.
         const scalar maxDeltaFsSpecies =
             updatePhaseState(finalLoop);
 
@@ -2689,17 +3371,20 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             updateSpeciesDiagnostics(true);
         }
 
-        Info<< "    loop " << corr + 1
-            << "/" << nSolidificationLoops_ << nl
-            << "        max |delta T|      = "
-            << maxDeltaTIter << " K" << nl
-            << "        max |CpT adv corr| = "
-            << maxEnergyAdvectionCorrection << " W/kg" << nl
-            << "        max |delta Carbon| = "
-            << maxDeltaCarbon << nl
-            << "        max |delta fs|     = "
-            << maxDeltaFs
-            << endl;
+        if (energyDiagnosticsNow)
+        {
+            Info<< "    loop " << corr + 1
+                << "/" << nSolidificationLoops_ << nl
+                << "        max |delta T|      = "
+                << maxDeltaTIter << " K" << nl
+                << "        max |CpT adv corr| = "
+                << maxEnergyAdvectionCorrection << " W/kg" << nl
+                << "        max |delta Carbon| = "
+                << maxDeltaCarbon << nl
+                << "        max |delta fs|     = "
+                << maxDeltaFs
+                << endl;
+        }
     }
 }
 
@@ -2739,6 +3424,13 @@ void Foam::solvers::continuousCastingMacrosegregation::postSolve()
     // new v11 discrete-operator audit printed during the final T correction.
     // This does not affect the solution.
     updateEnergyDiagnostics();
+
+    // Diagnostic-only decomposition of Lever-rule phase evolution into
+    // temperature-driven and composition-driven contributions.
+    updatePhaseCouplingDiagnostics();
+
+    // Adapt only the NEXT pseudo step. There is deliberately no rollback.
+    updatePseudoSteadyControl();
 }
 
 
