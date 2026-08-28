@@ -173,6 +173,15 @@ protected:
         //- Secondary dendrite-arm spacing [m]
         scalar lambda2_;
 
+        //- Microsegregation closure: lever or vollerBeckermann
+        word microsegregationModel_;
+
+        //- Voller-Beckermann coarsening correction alpha_C [-]
+        scalar vollerBeckermannAlphaC_;
+
+        //- Small regularisation for the vanishing-solid limit [-]
+        scalar microsegregationXi_;
+
         //- Prescribed solid velocity [m/s]
         //  CC-2: used by moving-solid BKC momentum resistance
         vector solidVelocity_;
@@ -201,8 +210,18 @@ protected:
         //- Liquid-phase solute mass fraction
         volScalarField CarbonL_;
 
-        //- Solid-phase solute mass fraction
+        //- Solid-phase average solute mass fraction
         volScalarField CarbonS_;
+
+        //- Interfacial solid concentration C_s^* = kp*C_l^*
+        volScalarField CarbonSInterface_;
+
+        //- Local solidification time used by the Voller-Beckermann
+        //  solutal Fourier number [s]
+        volScalarField localSolidificationTime_;
+
+        //- Voller-Beckermann back-diffusion coefficient beta [-]
+        volScalarField backDiffusionCoefficient_;
 
         //- Effective mixture solute diffusivity used by the implicit
         //  mixture-C diffusion operator:
@@ -329,12 +348,17 @@ protected:
         //- Update the target for the next pseudo time step
         void updatePseudoSteadyControl();
 
-        //- Update Lever-rule phase equilibrium:
+        //- Advance the local solidification-time history once per physical
+        //  time step. Dong et al. neglect remelting, so the history is
+        //  monotonic and freezes after complete solidification.
+        void updateLocalSolidificationTime();
+
+        //- Update phase state and microsegregation closure:
         //    Tliq = Tmelt + mliq*C
         //    Tsol = Tmelt + mliq*C/kp
-        //    fs   = Lever rule in the mushy interval
-        //    Cl   = C/[1 + fs(kp - 1)]
-        //    Cs   = kp*Cl
+        //    fs   = current composition-dependent phase relation
+        //    lever: Cl=C/[1+fs(kp-1)], Cs=kp*Cl
+        //    vollerBeckermann: Dong et al. Eqs. (17)-(23)
         //
         //  Returns the global maximum change in fs from the previous
         //  iteration.  If report=true, prints the full phase-state audit.
@@ -405,8 +429,17 @@ public:
         //- Reference to the liquid-phase solute field
         const volScalarField& CarbonL;
 
-        //- Reference to the solid-phase solute field
+        //- Reference to the solid-phase average solute field
         const volScalarField& CarbonS;
+
+        //- Reference to interfacial solid concentration
+        const volScalarField& CarbonSInterface;
+
+        //- Reference to local solidification time
+        const volScalarField& localSolidificationTime;
+
+        //- Reference to back-diffusion coefficient
+        const volScalarField& backDiffusionCoefficient;
 
         //- Reference to the mixture solute diffusivity
         const volScalarField& speciesDiffusivity;

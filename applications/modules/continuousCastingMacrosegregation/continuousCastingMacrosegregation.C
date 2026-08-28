@@ -1,4 +1,3 @@
- 
 /*---------------------------------------------------------------------------*\
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
@@ -344,6 +343,35 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
             << exit(FatalIOError);
     }
 
+    if
+    (
+        microsegregationModel_ != "lever"
+     && microsegregationModel_ != "vollerBeckermann"
+    )
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "microsegregationModel must be 'lever' or "
+            << "'vollerBeckermann'. Current value: "
+            << microsegregationModel_
+            << exit(FatalIOError);
+    }
+
+    if (vollerBeckermannAlphaC_ < 0)
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "vollerBeckermannAlphaC must be >= 0. Current value: "
+            << vollerBeckermannAlphaC_
+            << exit(FatalIOError);
+    }
+
+    if (microsegregationXi_ <= 0)
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "microsegregationXi must be > 0. Current value: "
+            << microsegregationXi_
+            << exit(FatalIOError);
+    }
+
     if (nSolidificationLoops_ < 1)
     {
         FatalIOErrorInFunction(alloyProperties_)
@@ -351,6 +379,40 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
             << nSolidificationLoops_
             << exit(FatalIOError);
     }
+}
+
+
+void Foam::solvers::continuousCastingMacrosegregation::
+updateLocalSolidificationTime()
+{
+    if (microsegregationModel_ != "vollerBeckermann")
+    {
+        return;
+    }
+
+    const scalar dt = runTime.deltaTValue();
+
+    if (dt <= SMALL)
+    {
+        FatalErrorInFunction
+            << "Non-positive time step while updating local solidification "
+            << "time: " << dt
+            << abort(FatalError);
+    }
+
+    // Dong et al. neglect remelting. Accumulate physical time only while
+    // the cell is currently mushy. Once fs reaches unity the value freezes.
+    forAll(fs_, celli)
+    {
+        const scalar f = fs_[celli];
+
+        if (f > SMALL && f < 1.0 - SMALL)
+        {
+            localSolidificationTime_[celli] += dt;
+        }
+    }
+
+    localSolidificationTime_.correctBoundaryConditions();
 }
 
 
@@ -380,6 +442,15 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
 
     scalar minCarbonS = GREAT;
     scalar maxCarbonS = -GREAT;
+
+    scalar minCarbonSInterface = GREAT;
+    scalar maxCarbonSInterface = -GREAT;
+
+    scalar minSolidificationTime = GREAT;
+    scalar maxSolidificationTime = -GREAT;
+
+    scalar minBackDiffusion = GREAT;
+    scalar maxBackDiffusion = -GREAT;
 
     scalar minCpMix = GREAT;
     scalar maxCpMix = -GREAT;
@@ -497,31 +568,163 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
                 << abort(FatalError);
         }
 
-        // Lever-rule phase compositions, Eqs. (29) and (30)
-        const scalar compositionDenominator =
-            1.0 + fsCell*(kp_ - 1.0);
+        scalar CarbonLCell = Ccell;
+        scalar CarbonSCell = Ccell;
+        scalar CarbonSInterfaceCell = kp_*Ccell;
+        scalar betaCell = 1.0;
 
-        if (compositionDenominator <= SMALL)
+        if (microsegregationModel_ == "lever")
         {
-            FatalErrorInFunction
-                << "Invalid Lever-rule composition denominator." << nl
-                << "    cell        = " << celli << nl
-                << "    fs          = " << fsCell << nl
-                << "    kp          = " << kp_
-                << abort(FatalError);
+            const scalar compositionDenominator =
+                1.0 + fsCell*(kp_ - 1.0);
+
+            if (compositionDenominator <= SMALL)
+            {
+                FatalErrorInFunction
+                    << "Invalid Lever-rule composition denominator." << nl
+                    << "    cell        = " << celli << nl
+                    << "    fs          = " << fsCell << nl
+                    << "    kp          = " << kp_
+                    << abort(FatalError);
+            }
+
+            CarbonLCell = Ccell/compositionDenominator;
+            CarbonSCell = kp_*CarbonLCell;
+            CarbonSInterfaceCell = CarbonSCell;
+            betaCell = 1.0;
         }
+        else
+        {
+            // Dong et al., Metals 2017, 7, 209, Eqs. (17)-(23).
+            const scalar tf =
+                max(localSolidificationTime_[celli], scalar(0));
 
-        const scalar CarbonLCell =
-            Ccell/compositionDenominator;
+            const scalar alpha =
+                4.0*DS_*tf/sqr(lambda2_);
 
-        const scalar CarbonSCell =
-            kp_*CarbonLCell;
+            const scalar alphaPlus =
+                alpha + vollerBeckermannAlphaC_;
+
+            if (alphaPlus <= SMALL)
+            {
+                FatalErrorInFunction
+                    << "Non-positive Voller-Beckermann alpha+." << nl
+                    << "    cell      = " << celli << nl
+                    << "    alpha     = " << alpha << nl
+                    << "    alphaC    = " << vollerBeckermannAlphaC_ << nl
+                    << "    tf        = " << tf << " s"
+                    << abort(FatalError);
+            }
+
+            // Eq. (18):
+            // beta = 2*alphaPlus*(1-exp(-1/alphaPlus))
+            //        - exp(-1/(2*alphaPlus))
+            betaCell =
+                2.0*alphaPlus
+               *(1.0 - exp(-1.0/alphaPlus))
+              - exp(-1.0/(2.0*alphaPlus));
+
+            betaCell =
+                min(max(betaCell, scalar(0)), scalar(1));
+
+            if (kp_ >= 1.0 - SMALL)
+            {
+                CarbonLCell = Ccell;
+                CarbonSInterfaceCell = Ccell;
+                CarbonSCell = Ccell;
+            }
+            else
+            {
+                const scalar betaDenominator =
+                    1.0 - betaCell*kp_;
+
+                if (betaDenominator <= SMALL)
+                {
+                    FatalErrorInFunction
+                        << "Invalid Voller-Beckermann denominator." << nl
+                        << "    cell    = " << celli << nl
+                        << "    beta    = " << betaCell << nl
+                        << "    kp      = " << kp_
+                        << abort(FatalError);
+                }
+
+                const scalar base =
+                    1.0 - betaDenominator*fsCell;
+
+                if (base <= SMALL)
+                {
+                    FatalErrorInFunction
+                        << "Invalid Voller-Beckermann concentration base."
+                        << nl
+                        << "    cell    = " << celli << nl
+                        << "    fs      = " << fsCell << nl
+                        << "    beta    = " << betaCell << nl
+                        << "    kp      = " << kp_ << nl
+                        << "    base    = " << base
+                        << abort(FatalError);
+                }
+
+                const scalar exponent =
+                    (kp_ - 1.0)/betaDenominator;
+
+                // Eq. (17): complete diffusion in the liquid means the
+                // phase-average liquid concentration equals C_l^*.
+                CarbonLCell =
+                    Ccell*pow(base, exponent);
+
+                // Eq. (22): local equilibrium applies at the interface.
+                CarbonSInterfaceCell =
+                    kp_*CarbonLCell;
+
+                if (fsCell > microsegregationXi_)
+                {
+                    // Eq. (16) gives the phase-average solid
+                    // concentration. Use max(fs,xi) only at the
+                    // vanishing-solid limit so mixture closure remains
+                    // exact for all resolved mushy/solid cells.
+                    CarbonSCell =
+                        (
+                            Ccell
+                          - (1.0 - fsCell)*CarbonLCell
+                        )
+                       /max(fsCell, microsegregationXi_);
+                }
+                else
+                {
+                    // At fs=0 the average solid composition is undefined
+                    // and inactive in every mixture term.
+                    CarbonSCell = CarbonSInterfaceCell;
+                }
+            }
+
+            if
+            (
+                CarbonLCell < -SMALL
+             || CarbonLCell > 1.0 + SMALL
+             || CarbonSCell < -SMALL
+             || CarbonSCell > 1.0 + SMALL
+            )
+            {
+                FatalErrorInFunction
+                    << "Invalid Voller-Beckermann phase concentration." << nl
+                    << "    cell       = " << celli << nl
+                    << "    Carbon     = " << Ccell << nl
+                    << "    fs         = " << fsCell << nl
+                    << "    CarbonL    = " << CarbonLCell << nl
+                    << "    CarbonS    = " << CarbonSCell << nl
+                    << "    beta       = " << betaCell << nl
+                    << "    tf         = " << tf << " s"
+                    << abort(FatalError);
+            }
+        }
 
         const scalar fsOldIter = fs_[celli];
 
         fs_[celli] = fsCell;
         CarbonL_[celli] = CarbonLCell;
         CarbonS_[celli] = CarbonSCell;
+        CarbonSInterface_[celli] = CarbonSInterfaceCell;
+        backDiffusionCoefficient_[celli] = betaCell;
         CpMix_[celli] = CpMixCell;
         kEff_[celli] = kEffCell;
         dfsdT_[celli] = dfsdTCell;
@@ -561,6 +764,19 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
         minCarbonS = min(minCarbonS, CarbonSCell);
         maxCarbonS = max(maxCarbonS, CarbonSCell);
 
+        minCarbonSInterface =
+            min(minCarbonSInterface, CarbonSInterfaceCell);
+        maxCarbonSInterface =
+            max(maxCarbonSInterface, CarbonSInterfaceCell);
+
+        minSolidificationTime =
+            min(minSolidificationTime, localSolidificationTime_[celli]);
+        maxSolidificationTime =
+            max(maxSolidificationTime, localSolidificationTime_[celli]);
+
+        minBackDiffusion = min(minBackDiffusion, betaCell);
+        maxBackDiffusion = max(maxBackDiffusion, betaCell);
+
         minCpMix = min(minCpMix, CpMixCell);
         maxCpMix = max(maxCpMix, CpMixCell);
 
@@ -590,6 +806,8 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
     fs_.correctBoundaryConditions();
     CarbonL_.correctBoundaryConditions();
     CarbonS_.correctBoundaryConditions();
+    CarbonSInterface_.correctBoundaryConditions();
+    backDiffusionCoefficient_.correctBoundaryConditions();
     CpMix_.correctBoundaryConditions();
     kEff_.correctBoundaryConditions();
     dfsdT_.correctBoundaryConditions();
@@ -617,6 +835,21 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
     minCarbonS = returnReduce(minCarbonS, minOp<scalar>());
     maxCarbonS = returnReduce(maxCarbonS, maxOp<scalar>());
 
+    minCarbonSInterface =
+        returnReduce(minCarbonSInterface, minOp<scalar>());
+    maxCarbonSInterface =
+        returnReduce(maxCarbonSInterface, maxOp<scalar>());
+
+    minSolidificationTime =
+        returnReduce(minSolidificationTime, minOp<scalar>());
+    maxSolidificationTime =
+        returnReduce(maxSolidificationTime, maxOp<scalar>());
+
+    minBackDiffusion =
+        returnReduce(minBackDiffusion, minOp<scalar>());
+    maxBackDiffusion =
+        returnReduce(maxBackDiffusion, maxOp<scalar>());
+
     minCpMix = returnReduce(minCpMix, minOp<scalar>());
     maxCpMix = returnReduce(maxCpMix, maxOp<scalar>());
 
@@ -641,7 +874,7 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
 
     if (report && diagnosticEnabled("phaseState"))
     {
-        Info<< "Lever-rule phase-state audit" << nl
+        Info<< "Phase-state/microsegregation audit" << nl
             << "    T min/max             = "
             << minT << " " << maxT << " K" << nl
             << "    Carbon min/max        = "
@@ -656,6 +889,15 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
             << minCarbonL << " " << maxCarbonL << nl
             << "    CarbonS min/max       = "
             << minCarbonS << " " << maxCarbonS << nl
+            << "    microsegregation      = "
+            << microsegregationModel_ << nl
+            << "    CarbonS* min/max      = "
+            << minCarbonSInterface << " " << maxCarbonSInterface << nl
+            << "    tf min/max            = "
+            << minSolidificationTime << " "
+            << maxSolidificationTime << " s" << nl
+            << "    beta min/max          = "
+            << minBackDiffusion << " " << maxBackDiffusion << nl
             << "    CpMix min/max         = "
             << minCpMix << " " << maxCpMix << " J/(kg K)" << nl
             << "    kEff min/max          = "
@@ -2226,6 +2468,30 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
     betaC_(alloyProperties_.lookup<scalar>("betaC")),
     TRef_(alloyProperties_.lookup<scalar>("TRef")),
     lambda2_(alloyProperties_.lookup<scalar>("lambda2")),
+    microsegregationModel_
+    (
+        alloyProperties_.lookupOrDefault<word>
+        (
+            "microsegregationModel",
+            "lever"
+        )
+    ),
+    vollerBeckermannAlphaC_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "vollerBeckermannAlphaC",
+            0.1
+        )
+    ),
+    microsegregationXi_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "microsegregationXi",
+            1e-12
+        )
+    ),
     solidVelocity_
     (
         alloyProperties_.lookupOrDefault<vector>
@@ -2319,6 +2585,51 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         ),
         mesh,
         dimensionedScalar(dimless, 0),
+        zeroGradientFvPatchScalarField::typeName
+    ),
+
+    CarbonSInterface_
+    (
+        IOobject
+        (
+            "CarbonSInterface",
+            runTime.name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar(dimless, 0),
+        zeroGradientFvPatchScalarField::typeName
+    ),
+
+    localSolidificationTime_
+    (
+        IOobject
+        (
+            "localSolidificationTime",
+            runTime.name(),
+            mesh,
+            IOobject::READ_IF_PRESENT,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar("zero", dimTime, 0.0),
+        zeroGradientFvPatchScalarField::typeName
+    ),
+
+    backDiffusionCoefficient_
+    (
+        IOobject
+        (
+            "backDiffusionCoefficient",
+            runTime.name(),
+            mesh,
+            IOobject::NO_READ,
+            IOobject::AUTO_WRITE
+        ),
+        mesh,
+        dimensionedScalar("one", dimless, 1.0),
         zeroGradientFvPatchScalarField::typeName
     ),
 
@@ -2559,6 +2870,9 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
     fs(fs_),
     CarbonL(CarbonL_),
     CarbonS(CarbonS_),
+    CarbonSInterface(CarbonSInterface_),
+    localSolidificationTime(localSolidificationTime_),
+    backDiffusionCoefficient(backDiffusionCoefficient_),
     speciesDiffusivity(speciesDiffusivity_),
     liquidAdvectionFactor(liquidAdvectionFactor_),
     macrosegregation(macrosegregation_),
@@ -2572,6 +2886,18 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
 {
     validateAlloyProperties();
     validatePseudoSteadyProperties();
+
+    if
+    (
+        pseudoSteadyEnabled_
+     && microsegregationModel_ == "vollerBeckermann"
+    )
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "vollerBeckermann requires physical-time solidification "
+            << "history. Disable pseudoSteady while validating this model."
+            << exit(FatalIOError);
+    }
 
     if (pseudoSteadyEnabled_)
     {
@@ -2641,6 +2967,8 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << "    TRef            = " << TRef_ << " K" << nl
         << "    g               = " << g_.value() << " m/s2" << nl
         << "    lambda2         = " << lambda2_ << " m" << nl
+        << "    microsegregationModel = " << microsegregationModel_ << nl
+        << "    VB alphaC       = " << vollerBeckermannAlphaC_ << nl
         << "    solidification loops = "
         << nSolidificationLoops_
         << endl;
@@ -2688,6 +3016,10 @@ Foam::solvers::continuousCastingMacrosegregation::~continuousCastingMacrosegrega
 
 void Foam::solvers::continuousCastingMacrosegregation::preSolve()
 {
+    // Advance the Voller-Beckermann physical-time history from the phase
+    // state carried by the previous completed time step.
+    updateLocalSolidificationTime();
+
     if (pseudoSteadyEnabled_)
     {
         U_.oldTime();
