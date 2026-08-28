@@ -1,3 +1,4 @@
+ 
 /*---------------------------------------------------------------------------*\
   =========                 |
   \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
@@ -2771,9 +2772,12 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
     //       + div(L fs U)
     //       - div(L fs (U-us)).
     //
-    // Eq. (16) recasts the local latent-storage term as
+    // The local latent-storage term is evaluated directly from the
+    // discrete phase-fraction change between physical time levels:
     //
-    //   d(fs)/dt = (dfs/dT) dT/dt.
+    //   d(fs)/dt ~= (fs^{n+1,k} - fs^n)/dt.
+    //
+    // This retains composition-driven phase change in the latent balance.
     //
     // For solidVelocity = 0 the two separately discretized latent-advection
     // terms use the same flux and cancel exactly, recovering CC-3.
@@ -2886,6 +2890,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
     if (energyDiagnosticsNow)
     {
         Info<< "Solidification/variable-property energy coupling" << nl
+        << "    latent storage              = implicit d(fs)/dT + explicit phase residual" << nl
         << "    Eq. (13) sensible advection = direct CpMix*T product" << nl
         << "    CC-4 latent advection       = term-by-term" << nl
         << "    bulk latent flux            = phi" << nl
@@ -2906,9 +2911,39 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 
     for (label corr = 0; corr < nSolidificationLoops_; ++corr)
     {
-        // Positive in the mush because dfs/dT < 0.
+        // Hybrid latent-storage linearisation.
+        //
+        // The total discrete phase change sought over the physical time step
+        // is
+        //
+        //   fs^{n+1} - fs^n.
+        //
+        // Keep the thermally stiff part implicit through dfs/dT, as in the
+        // original apparent-heat-capacity treatment, and place only the
+        // phase-change defect not explained by that thermal linearisation on
+        // the explicit RHS.  At fixed-point iteration k, define
+        //
+        //   Rf^k = (fs^k - fs^n)
+        //        - (dfs/dT)^k (T^k - T^n).
+        //
+        // Rf contains the composition-driven contribution and the nonlinear
+        // remainder of the Lever-rule closure.  The next thermal correction
+        // therefore represents
+        //
+        //   fs^{k+1} - fs^n
+        //     ~= (dfs/dT)^k (T^{k+1} - T^n) + Rf^k.
+        //
+        // With tLatentCp = -L*dfs/dT (>0 in the mush), the first term is
+        // treated implicitly in the matrix and +L*Rf/dt is added to the RHS.
         const tmp<volScalarField> tLatentCp =
             -latentHeatDim*dfsdT_;
+
+        const tmp<volScalarField> tPhaseResidual =
+            (fs_ - fs_.oldTime())
+          - dfsdT_*(T_ - T_.oldTime());
+
+        const tmp<volScalarField> tResidualLatentSource =
+            latentHeatDim*rDeltaT*tPhaseResidual();
 
         // Effective heat-diffusion coefficient after dividing Eq. (13)
         // by rho.  CC-8 adds turbulent heat transport only in the liquid:
@@ -3034,6 +3069,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
           - fvm::laplacian(tKbyRho(), T_)
          ==
             rDeltaT*tLatentCp()*T_.oldTime()
+          + tResidualLatentSource()
           - tEnergyAdvectionCorrection()
           + tBulkLatentAdvection()
           - tRelativeLatentAdvection()
@@ -3052,7 +3088,8 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         // The solved equation, after division by rho, is:
         //
         //   d(Cp*T)/dt
-        // + (-L*dfs/dT)*(T-Told)/dt
+        // - L*(dfs/dT)*(T-T.oldTime())/dt
+        // - L*Rf/dt
         // + div(interpolate(Cp)*phi,T)
         // + [directAdv(old iterate) - splitAdv(old iterate)]
         // - div(L fs U)
@@ -3083,8 +3120,15 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                   - CpMix_.oldTime()*T_.oldTime()
                 );
 
+            // Hybrid latent storage exactly matching TEqn:
+            //
+            //   -L*(dfs/dT)*(T-Told)/dt - L*Rf/dt.
+            //
+            // Since tLatentCp = -L*dfs/dT, the first contribution is
+            // +tLatentCp*(T-Told)/dt on the left-hand side.
             const tmp<volScalarField> tDiscreteLatentStorage =
-                rDeltaT*tLatentCp()*(T_ - T_.oldTime());
+                rDeltaT*tLatentCp()*(T_ - T_.oldTime())
+              - latentHeatDim*rDeltaT*tPhaseResidual();
 
             const tmp<volScalarField> tDiscreteSplitAdvection =
                 fvc::div(phiCp, T_, "div(phi,T)");

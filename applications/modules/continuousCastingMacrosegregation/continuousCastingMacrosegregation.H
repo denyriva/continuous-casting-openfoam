@@ -26,9 +26,9 @@ Description
       - v11 adds a diagnostic-only audit of the exact discrete energy operator
         used by the final solidification correction;
       - Lever-rule phase equilibrium fields fs, CarbonL and CarbonS;
-      - analytical Lever-rule dfs/dT;
-      - apparent-heat-capacity latent coupling with configurable
-        solidification iterations;
+      - analytical Lever-rule dfs/dT retained as a diagnostic field;
+      - direct discrete latent storage L*(fs-fs.oldTime())/dt with
+        configurable fixed-point solidification iterations;
       - thermo-solutal Boussinesq buoyancy in momentum;
       - standard Blake-Kozeny-Carman (BKC) mushy-zone permeability and
         implicit Darcy damping toward the prescribed solid velocity;
@@ -238,7 +238,8 @@ protected:
         volScalarField kEff_;
 
         //- Analytical Lever-rule derivative dfs/dT [1/K].
-        //  Zero outside the mushy interval.
+        //  Zero outside the mushy interval. Retained for diagnostics; the
+        //  energy equation uses the direct discrete change in fs.
         volScalarField dfsdT_;
 
         //- Local apparent storage coefficient
@@ -246,8 +247,8 @@ protected:
         //  [J/(kg K)]
         //
         //  This is retained as a diagnostic field. The energy equation
-        //  itself keeps the conservative d(CpMix*T)/dt term from Eq. (13)
-        //  and adds the latent contribution separately following Eq. (16).
+        //  itself keeps the conservative d(CpMix*T)/dt term and uses the
+        //  direct discrete latent source L*(fs-fs.oldTime())/dt.
         volScalarField CpApp_;
 
 
