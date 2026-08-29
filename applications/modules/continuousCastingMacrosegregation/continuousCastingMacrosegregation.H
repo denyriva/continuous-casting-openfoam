@@ -176,6 +176,12 @@ protected:
         //- Microsegregation closure: lever or vollerBeckermann
         word microsegregationModel_;
 
+        //- Species diffusion linearisation:
+        //    mixtureCorrection : historical Dmix implicit + phase corrections
+        //    phaseLinearized   : Picard linearisation of the direct
+        //                        phase-separated Dong/Bennon-Incropera flux
+        word speciesDiffusionForm_;
+
         //- Voller-Beckermann coarsening correction alpha_C [-]
         scalar vollerBeckermannAlphaC_;
 

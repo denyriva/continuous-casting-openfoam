@@ -356,6 +356,19 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
             << exit(FatalIOError);
     }
 
+    if
+    (
+        speciesDiffusionForm_ != "mixtureCorrection"
+     && speciesDiffusionForm_ != "phaseLinearized"
+    )
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "speciesDiffusionForm must be 'mixtureCorrection' or "
+            << "'phaseLinearized'. Current value: "
+            << speciesDiffusionForm_
+            << exit(FatalIOError);
+    }
+
     if (vollerBeckermannAlphaC_ < 0)
     {
         FatalIOErrorInFunction(alloyProperties_)
@@ -1441,9 +1454,37 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     //   + div(U C)                    : implicit in Carbon
     //   - div((U-us) (Cl-C))           : explicit RHS correction
     //
-    // The mixture diffusion term is implicit. The liquid/solid
-    // phase-difference diffusion terms remain explicit. For the published
-    // AFRODITE properties DS = 0.
+    // Two diffusion linearisations are selectable at run time:
+    //
+    // mixtureCorrection (historical)
+    // --------------------------------
+    //   implicit:  div((fl*DlEff + fs*Ds) grad(C))
+    //   explicit:  phase-difference correction terms
+    //
+    // phaseLinearized (CC10 diagnostic)
+    // ----------------------------------
+    // Freeze the local phase closure during a Picard iteration:
+    //
+    //   Cl = ql*C,   Cs = qs*C
+    //
+    // and split Dong/Bennon-Incropera's direct phase flux
+    //
+    //   fl*DlEff*grad(Cl) + fs*Ds*grad(Cs)
+    //
+    // as
+    //
+    //   (fl*DlEff*ql + fs*Ds*qs)*grad(C)
+    //   + fl*DlEff*C*grad(ql)
+    //   + fs*Ds*C*grad(qs).
+    //
+    // The first part is implicit in C; the phase-state-gradient pieces are
+    // explicit Picard corrections.  At fixed-point convergence the summed
+    // finite-volume diffusion operator recovers the direct phase-separated
+    // flux, but without relying on cancellation of Dmix*grad(C) against
+    // O(1) phase-difference terms.
+    //
+    // This switch changes only the numerical linearisation of diffusion,
+    // not the continuous species equation.
 
     updateSpeciesDiagnostics(false);
 
@@ -1490,6 +1531,73 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
             false
         ),
         scalar(1) - fs_
+    );
+
+    // Frozen local phase ratios used by the phaseLinearized Picard form.
+    // updatePhaseState() has already supplied CarbonL_/CarbonS_ consistent
+    // with the current Carbon_ iterate.
+    const dimensionedScalar CarbonLinearisationFloor
+    (
+        "CarbonLinearisationFloor",
+        dimless,
+        max(microsegregationXi_, scalar(1e-14))
+    );
+
+    const volScalarField carbonForLinearisation
+    (
+        IOobject
+        (
+            "carbonForLinearisationTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        max(Carbon_, CarbonLinearisationFloor)
+    );
+
+    const volScalarField qLiquid
+    (
+        IOobject
+        (
+            "qLiquidSpeciesTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        CarbonL_/carbonForLinearisation
+    );
+
+    const volScalarField qSolid
+    (
+        IOobject
+        (
+            "qSolidSpeciesTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        CarbonS_/carbonForLinearisation
+    );
+
+    const volScalarField phaseLinearizedDiffusivity
+    (
+        IOobject
+        (
+            "phaseLinearizedDiffusivityTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        liquidFraction*effectiveLiquidDiffusivity*qLiquid
+      + fs_*DSDim*qSolid
     );
 
     // Uniform solid-velocity face flux and liquid-solid relative flux.
@@ -1552,30 +1660,86 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
 
     const scalarField CarbonBefore(Carbon_.primitiveField());
 
-    fvScalarMatrix CarbonEqn
-    (
-        fvm::ddt(Carbon_)
-      + fvm::div(phi_, Carbon_, "div(phi,Carbon)")
-      - fvm::laplacian(speciesDiffusivity_, Carbon_)
-     ==
+    // Direct phase-flux Picard corrections.  These are exactly the
+    // difference between the frozen direct phase operator and the chosen
+    // phaseLinearized implicit Jacobian at the current iterate:
+    //
+    //   laplacian(fl*DlEff, Cl)
+    // - laplacian(fl*DlEff*ql, C)
+    //
+    // and analogously for the solid phase.
+    const tmp<volScalarField> tLiquidPhaseLinearizedCorrection =
         fvc::laplacian
         (
             liquidFraction*effectiveLiquidDiffusivity,
-            CarbonL_ - Carbon_
+            CarbonL_
         )
-      + fvc::laplacian
+      - fvc::laplacian
+        (
+            liquidFraction*effectiveLiquidDiffusivity*qLiquid,
+            Carbon_
+        );
+
+    const tmp<volScalarField> tSolidPhaseLinearizedCorrection =
+        fvc::laplacian
         (
             fs_*DSDim,
-            CarbonS_ - Carbon_
+            CarbonS_
         )
-      - fvc::div
+      - fvc::laplacian
         (
-            relativePhi,
-            relativeLiquidComposition,
-            "div(phi,Carbon)"
-        )
-    );
+            fs_*DSDim*qSolid,
+            Carbon_
+        );
 
+    tmp<fvScalarMatrix> tCarbonEqn;
+
+    if (speciesDiffusionForm_ == "phaseLinearized")
+    {
+        tCarbonEqn =
+        (
+            fvm::ddt(Carbon_)
+          + fvm::div(phi_, Carbon_, "div(phi,Carbon)")
+          - fvm::laplacian(phaseLinearizedDiffusivity, Carbon_)
+         ==
+            tLiquidPhaseLinearizedCorrection()
+          + tSolidPhaseLinearizedCorrection()
+          - fvc::div
+            (
+                relativePhi,
+                relativeLiquidComposition,
+                "div(phi,Carbon)"
+            )
+        );
+    }
+    else
+    {
+        tCarbonEqn =
+        (
+            fvm::ddt(Carbon_)
+          + fvm::div(phi_, Carbon_, "div(phi,Carbon)")
+          - fvm::laplacian(speciesDiffusivity_, Carbon_)
+         ==
+            fvc::laplacian
+            (
+                liquidFraction*effectiveLiquidDiffusivity,
+                CarbonL_ - Carbon_
+            )
+          + fvc::laplacian
+            (
+                fs_*DSDim,
+                CarbonS_ - Carbon_
+            )
+          - fvc::div
+            (
+                relativePhi,
+                relativeLiquidComposition,
+                "div(phi,Carbon)"
+            )
+        );
+    }
+
+    fvScalarMatrix& CarbonEqn = tCarbonEqn.ref();
     CarbonEqn.solve();
 
     // -----------------------------------------------------------------
@@ -1590,11 +1754,15 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     //
     //   dC/dt
     // + div(phi C)
-    // - laplacian(DmixEff,C)
-    // - laplacian(fl DlEff,Cl-C)
-    // - laplacian(fs Ds,Cs-C)
+    // - [active implicit diffusion]
+    // - [liquid explicit diffusion correction]
+    // - [solid explicit diffusion correction]
     // + div(phiRel,Cl-C)
     // = 0.
+    //
+    // For mixtureCorrection these are the historical Dmix and phase-
+    // difference terms.  For phaseLinearized they are the frozen Picard
+    // decomposition of the direct phase-separated flux.
     //
     // Multiplication by rho*V and global summation gives kg/s of solute.
     // Unlike the historical "relative inventory err", this balance remains
@@ -1635,22 +1803,58 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
         const tmp<volScalarField> tBulkSpeciesAdvection =
             fvc::div(phi_, Carbon_, "div(phi,Carbon)");
 
-        const tmp<volScalarField> tMixtureSpeciesDiffusion =
-            fvc::laplacian(speciesDiffusivity_, Carbon_);
+        tmp<volScalarField> tMixtureSpeciesDiffusion;
+        tmp<volScalarField> tLiquidSpeciesCorrection;
+        tmp<volScalarField> tSolidSpeciesCorrection;
 
-        const tmp<volScalarField> tLiquidSpeciesCorrection =
-            fvc::laplacian
-            (
-                liquidFraction*effectiveLiquidDiffusivity,
-                CarbonL_ - Carbon_
-            );
+        if (speciesDiffusionForm_ == "phaseLinearized")
+        {
+            tMixtureSpeciesDiffusion =
+                fvc::laplacian(phaseLinearizedDiffusivity, Carbon_);
 
-        const tmp<volScalarField> tSolidSpeciesCorrection =
-            fvc::laplacian
-            (
-                fs_*DSDim,
-                CarbonS_ - Carbon_
-            );
+            tLiquidSpeciesCorrection =
+                fvc::laplacian
+                (
+                    liquidFraction*effectiveLiquidDiffusivity,
+                    CarbonL_
+                )
+              - fvc::laplacian
+                (
+                    liquidFraction*effectiveLiquidDiffusivity*qLiquid,
+                    Carbon_
+                );
+
+            tSolidSpeciesCorrection =
+                fvc::laplacian
+                (
+                    fs_*DSDim,
+                    CarbonS_
+                )
+              - fvc::laplacian
+                (
+                    fs_*DSDim*qSolid,
+                    Carbon_
+                );
+        }
+        else
+        {
+            tMixtureSpeciesDiffusion =
+                fvc::laplacian(speciesDiffusivity_, Carbon_);
+
+            tLiquidSpeciesCorrection =
+                fvc::laplacian
+                (
+                    liquidFraction*effectiveLiquidDiffusivity,
+                    CarbonL_ - Carbon_
+                );
+
+            tSolidSpeciesCorrection =
+                fvc::laplacian
+                (
+                    fs_*DSDim,
+                    CarbonS_ - Carbon_
+                );
+        }
 
         const tmp<volScalarField> tRelativeSpeciesAdvection =
             fvc::div
@@ -1674,6 +1878,176 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
 
         const volScalarField& relativeSpeciesAdvection =
             tRelativeSpeciesAdvection();
+
+        // -------------------------------------------------------------
+        // Spatial species diagnostics -- signed local LHS contributions
+        //
+        // Units: kg/(m3 s)
+        //
+        //   storage
+        // + bulk advection
+        // + mixture diffusion
+        // + liquid correction
+        // + solid correction
+        // + relative advection
+        // = residual
+        //
+        // Diffusive contributions carry a minus sign because the
+        // corresponding laplacian operators appear on the RHS of the
+        // implemented Carbon equation.
+        const dimensionedScalar rhoSpeciesDiagnostic
+        (
+            "rhoSpeciesDiagnostic",
+            dimDensity,
+            rho_
+        );
+
+        const dimensionedScalar rhoRDeltaTSpeciesDiagnostic
+        (
+            "rhoRDeltaTSpeciesDiagnostic",
+            dimDensity/dimTime,
+            rho_*rDeltaTSpecies
+        );
+
+        volScalarField carbonStorage
+        (
+            IOobject
+            (
+                "carbonStorage",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            rhoRDeltaTSpeciesDiagnostic
+           *(Carbon_ - Carbon_.oldTime())
+        );
+
+        volScalarField carbonBulkAdvection
+        (
+            IOobject
+            (
+                "carbonBulkAdvection",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            rhoSpeciesDiagnostic*bulkSpeciesAdvection
+        );
+
+        // Historical field name retained for A/B plotting.  In
+        // phaseLinearized mode this is the active implicit diffusion term,
+        // not the historical Dmix operator.
+        volScalarField carbonMixtureDiffusion
+        (
+            IOobject
+            (
+                "carbonMixtureDiffusion",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+           -rhoSpeciesDiagnostic*mixtureSpeciesDiffusion
+        );
+
+        volScalarField carbonLiquidCorrection
+        (
+            IOobject
+            (
+                "carbonLiquidCorrection",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+           -rhoSpeciesDiagnostic*liquidSpeciesCorrection
+        );
+
+        volScalarField carbonSolidCorrection
+        (
+            IOobject
+            (
+                "carbonSolidCorrection",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+           -rhoSpeciesDiagnostic*solidSpeciesCorrection
+        );
+
+        volScalarField carbonRelativeAdvection
+        (
+            IOobject
+            (
+                "carbonRelativeAdvection",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            rhoSpeciesDiagnostic*relativeSpeciesAdvection
+        );
+
+        volScalarField carbonNetDiffusion
+        (
+            IOobject
+            (
+                "carbonNetDiffusion",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            carbonMixtureDiffusion
+          + carbonLiquidCorrection
+          + carbonSolidCorrection
+        );
+
+        volScalarField carbonResidual
+        (
+            IOobject
+            (
+                "carbonResidual",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE
+            ),
+            carbonStorage
+          + carbonBulkAdvection
+          + carbonNetDiffusion
+          + carbonRelativeAdvection
+        );
+
+        // Write spatial Carbon diagnostics ONLY at the solver's normal
+        // output times.  With writeControl adjustableRunTime, OpenFOAM
+        // adjusts deltaT so runTime.writeTime() becomes true at the requested
+        // physical output time.  Gating the explicit writes here avoids the
+        // historical behaviour of creating processor*/<every time-step>/
+        // directories that did not correspond to controlDict output times.
+        //
+        // The fields are local temporaries, so AUTO_WRITE cannot be relied on;
+        // they must still be written explicitly when writeTime() is true.
+        if (runTime.writeTime())
+        {
+            carbonStorage.write();
+            carbonBulkAdvection.write();
+            carbonMixtureDiffusion.write();
+            carbonLiquidCorrection.write();
+            carbonSolidCorrection.write();
+            carbonRelativeAdvection.write();
+            carbonNetDiffusion.write();
+            carbonResidual.write();
+
+            if (Pstream::master())
+            {
+                Info<< "Spatial Carbon diagnostics written at controlDict "
+                    << "write time " << runTime.value() << " s" << endl;
+            }
+        }
 
         scalar storageRate = 0.0;
         scalar bulkAdvectionRate = 0.0;
@@ -2008,7 +2382,7 @@ void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics()
     // - d(L fs)/dt
     // - div(L fs U)
     // + div(L fs (U-us))
-    // - div((kEff/rho + fl CpL nut/Prt) grad(T))
+    // - div((kEff/rho + I_liquid CpL nut/Prt) grad(T))
     // = 0.
     //
     // Hence
@@ -2254,11 +2628,11 @@ void Foam::solvers::continuousCastingMacrosegregation::updateEnergyDiagnostics()
 
         forAll(snGradT, facei)
         {
-            const scalar flFace =
-                min(max(1.0 - fsp[facei], scalar(0)), scalar(1));
+            const scalar fullyLiquidFace =
+                (fsp[facei] <= SMALL ? 1.0 : 0.0);
 
             const scalar kTurbFace =
-                rho_*CpLiquid_*flFace
+                rho_*CpLiquid_*fullyLiquidFace
                *max(nutp[facei], scalar(0))/Prt_;
 
             conductiveBoundaryPower +=
@@ -2474,6 +2848,14 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         (
             "microsegregationModel",
             "lever"
+        )
+    ),
+    speciesDiffusionForm_
+    (
+        alloyProperties_.lookupOrDefault<word>
+        (
+            "speciesDiffusionForm",
+            "mixtureCorrection"
         )
     ),
     vollerBeckermannAlphaC_
@@ -2925,7 +3307,9 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
     Info<< "continuousCastingMacrosegregation: species discretization" << nl
         << "    Eq. (19) advection = term-by-term" << nl
         << "    div(U*C)           = implicit" << nl
-        << "    div(U*(Cl-C))      = explicit RHS correction"
+        << "    div(U*(Cl-C))      = explicit RHS correction" << nl
+        << "    species diffusion  = " << speciesDiffusionForm_ << nl
+        << "    phaseLinearized    = direct phase-flux Picard Jacobian"
         << endl;
 
     Info<< "continuousCastingMacrosegregation: energy discretization" << nl
@@ -2968,6 +3352,7 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << "    g               = " << g_.value() << " m/s2" << nl
         << "    lambda2         = " << lambda2_ << " m" << nl
         << "    microsegregationModel = " << microsegregationModel_ << nl
+        << "    speciesDiffusionForm  = " << speciesDiffusionForm_ << nl
         << "    VB alphaC       = " << vollerBeckermannAlphaC_ << nl
         << "    solidification loops = "
         << nSolidificationLoops_
@@ -3195,19 +3580,40 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
     const volScalarField& nutEnergy =
         tNutEnergy();
 
-    const volScalarField liquidFractionEnergy
+    // Dong-faithful turbulent heat switch:
+    // turbulent thermal transport is active only in fully liquid cells.
+    // In the mushy and solid regions, heat conduction uses phase-weighted
+    // molecular conductivity only.
+    volScalarField fullyLiquidEnergy
     (
         IOobject
         (
-            "liquidFractionEnergyTmp",
+            "fullyLiquidEnergyTmp",
             runTime.name(),
             mesh_,
             IOobject::NO_READ,
             IOobject::NO_WRITE,
             false
         ),
-        scalar(1) - fs_
+        mesh_,
+        dimensionedScalar("zero", dimless, 0.0)
     );
+
+    forAll(fullyLiquidEnergy, celli)
+    {
+        fullyLiquidEnergy[celli] = (fs_[celli] <= SMALL ? 1.0 : 0.0);
+    }
+
+    forAll(fullyLiquidEnergy.boundaryField(), patchi)
+    {
+        scalarField& maskp = fullyLiquidEnergy.boundaryFieldRef()[patchi];
+        const fvPatchScalarField& fsp = fs_.boundaryField()[patchi];
+
+        forAll(maskp, facei)
+        {
+            maskp[facei] = (fsp[facei] <= SMALL ? 1.0 : 0.0);
+        }
+    }
 
     const dimensionedScalar CpLiquidDim
     (
@@ -3227,7 +3633,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         << "    CC-4 latent advection       = term-by-term" << nl
         << "    bulk latent flux            = phi" << nl
         << "    relative latent flux        = phi - phiSolid" << nl
-        << "    CC-8 turbulent heat         = fl*CpLiquid*nut/Prt" << nl
+        << "    Dong turbulent heat         = fully-liquid only: CpLiquid*nut/Prt" << nl
         << "    Prt                          = " << Prt_ << nl
         << "    nut min/max                  = "
         << gMin(nutEnergy.primitiveField()) << " "
@@ -3278,14 +3684,20 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             latentHeatDim*rDeltaT*tPhaseResidual();
 
         // Effective heat-diffusion coefficient after dividing Eq. (13)
-        // by rho.  CC-8 adds turbulent heat transport only in the liquid:
+        // by rho.
         //
-        //   kEff/rho + fl*CpLiquid*nut/Prt.
+        // Dong Eq. (10): turbulent heat transport is present only in the
+        // fully liquid region.  The mush uses the phase-weighted molecular
+        // conductivity kEff = fs*kSolid + fl*kLiquid without a nut term.
         //
-        // For laminar models nut=0, so this reduces exactly to CC-7.
+        //   fully liquid: kLiquid/rho + CpLiquid*nut/Prt
+        //   mush:         kEff/rho
+        //   solid:        kSolid/rho
+        //
+        // For laminar models nut=0.
         const tmp<volScalarField> tKbyRho =
             kEff_/rhoDim
-          + liquidFractionEnergy*CpLiquidDim*nutEnergy/Prt_;
+          + fullyLiquidEnergy*CpLiquidDim*nutEnergy/Prt_;
 
         // CC-4 latent-energy advection terms are discretized separately.
         //
