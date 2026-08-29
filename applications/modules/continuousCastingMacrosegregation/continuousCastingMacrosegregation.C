@@ -1777,7 +1777,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     // historical inventory-from-initial-state metric is retained only as a
     // state diagnostic.
 
-    if (report && diagnosticEnabled("species"))
+    if (report && (runTime.writeTime() || diagnosticEnabled("species")))
     {
         // CC-9 validation cases use first-order Euler time integration.
         // Foundation v14 does not provide fvc::ddt(volScalarField), so
