@@ -1642,7 +1642,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
         phi_ - solidPhi
     );
 
-    // Explicit relative-composition field appearing in the final advective
+    // Dong-form relative-composition field appearing in the final advective
     // term of Eq. (19).
     const volScalarField relativeLiquidComposition
     (
@@ -1655,7 +1655,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
             IOobject::NO_WRITE,
             false
         ),
-        CarbonL_ - Carbon_
+        fs_*(CarbonL_ - CarbonS_)
     );
 
     const scalarField CarbonBefore(Carbon_.primitiveField());
@@ -1741,6 +1741,205 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
 
     fvScalarMatrix& CarbonEqn = tCarbonEqn.ref();
     CarbonEqn.solve();
+
+    // -----------------------------------------------------------------
+    // Pre-phase-state Carbon minimum diagnostic
+    // Evaluated immediately after CarbonEqn.solve(), before updatePhaseState().
+    // Diagnostic only.
+    // -----------------------------------------------------------------
+
+    scalar localMinCarbon = GREAT;
+    label localMinCarbonCell = -1;
+
+    forAll(Carbon_, celli)
+    {
+        if (Carbon_[celli] < localMinCarbon)
+        {
+            localMinCarbon = Carbon_[celli];
+            localMinCarbonCell = celli;
+        }
+    }
+
+    const scalar globalMinCarbon =
+        returnReduce(localMinCarbon, minOp<scalar>());
+
+    // Only evaluate the detailed operator decomposition when Carbon is
+    // becoming suspicious, to avoid unnecessary work every Picard solve.
+    if (globalMinCarbon < 0.0015)
+    {
+        const scalar rDeltaTFailure =
+            1.0/runTime.deltaTValue();
+
+        const volScalarField failureStorage
+        (
+            IOobject
+            (
+                "failureStorageTmp",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE,
+                false
+            ),
+            rDeltaTFailure*(Carbon_ - Carbon_.oldTime())
+        );
+
+        const tmp<volScalarField> tFailureBulkAdvection =
+            fvc::div(phi_, Carbon_, "div(phi,Carbon)");
+
+        tmp<volScalarField> tFailureMixtureDiffusion;
+        tmp<volScalarField> tFailureLiquidCorrection;
+        tmp<volScalarField> tFailureSolidCorrection;
+
+        if (speciesDiffusionForm_ == "phaseLinearized")
+        {
+            tFailureMixtureDiffusion =
+                fvc::laplacian
+                (
+                    phaseLinearizedDiffusivity,
+                    Carbon_
+                );
+
+            tFailureLiquidCorrection =
+                fvc::laplacian
+                (
+                    liquidFraction*effectiveLiquidDiffusivity,
+                    CarbonL_
+                )
+              - fvc::laplacian
+                (
+                    liquidFraction*effectiveLiquidDiffusivity*qLiquid,
+                    Carbon_
+                );
+
+            tFailureSolidCorrection =
+                fvc::laplacian
+                (
+                    fs_*DSDim,
+                    CarbonS_
+                )
+              - fvc::laplacian
+                (
+                    fs_*DSDim*qSolid,
+                    Carbon_
+                );
+        }
+        else
+        {
+            tFailureMixtureDiffusion =
+                fvc::laplacian
+                (
+                    speciesDiffusivity_,
+                    Carbon_
+                );
+
+            tFailureLiquidCorrection =
+                fvc::laplacian
+                (
+                    liquidFraction*effectiveLiquidDiffusivity,
+                    CarbonL_ - Carbon_
+                );
+
+            tFailureSolidCorrection =
+                fvc::laplacian
+                (
+                    fs_*DSDim,
+                    CarbonS_ - Carbon_
+                );
+        }
+
+        const tmp<volScalarField> tFailureRelativeAdvection =
+            fvc::div
+            (
+                relativePhi,
+                relativeLiquidComposition,
+                "div(phi,Carbon)"
+            );
+
+        const volScalarField& failureBulkAdvection =
+            tFailureBulkAdvection();
+
+        const volScalarField& failureMixtureDiffusion =
+            tFailureMixtureDiffusion();
+
+        const volScalarField& failureLiquidCorrection =
+            tFailureLiquidCorrection();
+
+        const volScalarField& failureSolidCorrection =
+            tFailureSolidCorrection();
+
+        const volScalarField& failureRelativeAdvection =
+            tFailureRelativeAdvection();
+
+        if
+        (
+            localMinCarbonCell >= 0
+         && mag(localMinCarbon - globalMinCarbon)
+            <= SMALL*max(scalar(1), mag(globalMinCarbon))
+        )
+        {
+            const label celli = localMinCarbonCell;
+
+            const scalar CarbonBeforeSolve = CarbonBefore[celli];
+            const scalar CarbonAfterSolve = Carbon_[celli];
+            const scalar deltaCarbonSolve =
+                CarbonAfterSolve - CarbonBeforeSolve;
+
+            scalar liquidCorrectionUsed =
+                failureLiquidCorrection[celli];
+
+            scalar solidCorrectionUsed =
+                failureSolidCorrection[celli];
+
+            if (speciesDiffusionForm_ == "phaseLinearized")
+            {
+                liquidCorrectionUsed =
+                    tLiquidPhaseLinearizedCorrection()[celli];
+
+                solidCorrectionUsed =
+                    tSolidPhaseLinearizedCorrection()[celli];
+            }
+
+            const scalar netDiffusionUsed =
+                failureMixtureDiffusion[celli]
+              + liquidCorrectionUsed
+              + solidCorrectionUsed;
+
+            const scalar residual =
+                failureStorage[celli]
+              + failureBulkAdvection[celli]
+              - netDiffusionUsed
+              + failureRelativeAdvection[celli];
+
+            Pout<< "CARBON_FAILURE_DIAG"
+                << " time=" << runTime.value()
+                << " dt=" << runTime.deltaTValue()
+                << " proc=" << Pstream::myProcNo()
+                << " cell=" << celli
+                << " Ccoord=" << mesh_.C()[celli]
+                << " Carbon=" << Carbon_[celli]
+                << " CarbonBeforeSolve=" << CarbonBeforeSolve
+                << " CarbonAfterSolve=" << CarbonAfterSolve
+                << " deltaCarbonSolve=" << deltaCarbonSolve
+                << " fs=" << fs_[celli]
+                << " CarbonL=" << CarbonL_[celli]
+                << " CarbonS=" << CarbonS_[celli]
+                << " T=" << T_[celli]
+                << " U=" << U_[celli]
+                << " storage=" << failureStorage[celli]
+                << " bulkAdv=" << failureBulkAdvection[celli]
+                << " mixtureDiff=" << failureMixtureDiffusion[celli]
+                << " liquidCorrRecomputed=" << failureLiquidCorrection[celli]
+                << " liquidCorrUsed=" << liquidCorrectionUsed
+                << " solidCorrRecomputed=" << failureSolidCorrection[celli]
+                << " solidCorrUsed=" << solidCorrectionUsed
+                << " netDiffUsed=" << netDiffusionUsed
+                << " relativeAdv=" << failureRelativeAdvection[celli]
+                << " residual=" << residual
+                << endl;
+        }
+    }
+
 
     // -----------------------------------------------------------------
     // CC-9 open-domain species-conservation audit -- DIAGNOSTIC ONLY
@@ -4202,6 +4401,120 @@ thermophysicalTransportCorrector()
 void Foam::solvers::continuousCastingMacrosegregation::postSolve()
 {
     updateBKCDrag(true);
+    // Per-time-step flow/Courant diagnostic
+    const scalar flowDiagDt = runTime.deltaTValue();
+
+    const scalarField flowDiagSumPhi
+    (
+        fvc::surfaceSum(mag(phi_))().primitiveField()
+    );
+
+
+    scalar localMaxCo = -GREAT;
+    scalar localMaxU = -GREAT;
+    scalar localMaxURel = -GREAT;
+
+    label localMaxCoCell = -1;
+    label localMaxUCell = -1;
+    label localMaxURelCell = -1;
+
+    forAll(U_, celli)
+    {
+        const scalar cellCo =
+            0.5*flowDiagDt*flowDiagSumPhi[celli]/mesh_.V()[celli];
+
+        const scalar magUCell = mag(U_[celli]);
+        const scalar magURelCell = mag(U_[celli] - solidVelocity_);
+
+        if (cellCo > localMaxCo)
+        {
+            localMaxCo = cellCo;
+            localMaxCoCell = celli;
+        }
+
+        if (magUCell > localMaxU)
+        {
+            localMaxU = magUCell;
+            localMaxUCell = celli;
+        }
+
+        if (magURelCell > localMaxURel)
+        {
+            localMaxURel = magURelCell;
+            localMaxURelCell = celli;
+        }
+    }
+
+    const scalar globalMaxCo =
+        returnReduce(localMaxCo, maxOp<scalar>());
+
+    const scalar globalMaxU =
+        returnReduce(localMaxU, maxOp<scalar>());
+
+    const scalar globalMaxURel =
+        returnReduce(localMaxURel, maxOp<scalar>());
+
+    if
+    (
+        localMaxCoCell >= 0
+     && mag(localMaxCo - globalMaxCo)
+        <= SMALL*max(scalar(1), mag(globalMaxCo))
+    )
+    {
+        Pout<< "FLOW_DIAG CoMax"
+            << " time=" << runTime.value()
+            << " dt=" << flowDiagDt
+            << " Co=" << localMaxCo
+            << " proc=" << Pstream::myProcNo()
+            << " cell=" << localMaxCoCell
+            << " C=" << mesh_.C()[localMaxCoCell]
+            << " U=" << U_[localMaxCoCell]
+            << " |U|=" << mag(U_[localMaxCoCell])
+            << " |U-us|="
+            << mag(U_[localMaxCoCell] - solidVelocity_)
+            << " fs=" << fs_[localMaxCoCell]
+            << " Carbon=" << Carbon_[localMaxCoCell]
+            << endl;
+    }
+
+    if
+    (
+        localMaxUCell >= 0
+     && mag(localMaxU - globalMaxU)
+        <= SMALL*max(scalar(1), mag(globalMaxU))
+    )
+    {
+        Pout<< "FLOW_DIAG UMax"
+            << " time=" << runTime.value()
+            << " |U|=" << localMaxU
+            << " proc=" << Pstream::myProcNo()
+            << " cell=" << localMaxUCell
+            << " C=" << mesh_.C()[localMaxUCell]
+            << " U=" << U_[localMaxUCell]
+            << " fs=" << fs_[localMaxUCell]
+            << " Carbon=" << Carbon_[localMaxUCell]
+            << endl;
+    }
+
+    if
+    (
+        localMaxURelCell >= 0
+     && mag(localMaxURel - globalMaxURel)
+        <= SMALL*max(scalar(1), mag(globalMaxURel))
+    )
+    {
+        Pout<< "FLOW_DIAG URelMax"
+            << " time=" << runTime.value()
+            << " |U-us|=" << localMaxURel
+            << " proc=" << Pstream::myProcNo()
+            << " cell=" << localMaxURelCell
+            << " C=" << mesh_.C()[localMaxURelCell]
+            << " U=" << U_[localMaxURelCell]
+            << " fs=" << fs_[localMaxURelCell]
+            << " Carbon=" << Carbon_[localMaxURelCell]
+            << endl;
+    }
+
 
     // Refresh written species diagnostic fields using the final state of
     // the physical time step. The detailed audit is already printed at the
