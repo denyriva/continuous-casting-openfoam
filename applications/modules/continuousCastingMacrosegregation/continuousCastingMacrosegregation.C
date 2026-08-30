@@ -392,6 +392,52 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
             << nSolidificationLoops_
             << exit(FatalIOError);
     }
+
+    if
+    (
+        solidificationIterationMode_ != "fixed"
+     && solidificationIterationMode_ != "converged"
+    )
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "solidificationIterationMode must be 'fixed' or 'converged'. "
+            << "Current value: " << solidificationIterationMode_
+            << exit(FatalIOError);
+    }
+
+    if
+    (
+        minSolidificationIterations_ < 1
+     || maxSolidificationIterations_ < minSolidificationIterations_
+    )
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "Require 1 <= minSolidificationIterations <= "
+            << "maxSolidificationIterations." << nl
+            << "    minSolidificationIterations = "
+            << minSolidificationIterations_ << nl
+            << "    maxSolidificationIterations = "
+            << maxSolidificationIterations_
+            << exit(FatalIOError);
+    }
+
+    if
+    (
+        temperatureCouplingTolerance_ <= SMALL
+     || carbonCouplingTolerance_ <= SMALL
+     || solidFractionCouplingTolerance_ <= SMALL
+    )
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "All nonlinear coupling tolerances must be > 0." << nl
+            << "    temperatureCouplingTolerance = "
+            << temperatureCouplingTolerance_ << nl
+            << "    carbonCouplingTolerance = "
+            << carbonCouplingTolerance_ << nl
+            << "    solidFractionCouplingTolerance = "
+            << solidFractionCouplingTolerance_
+            << exit(FatalIOError);
+    }
 }
 
 
@@ -3085,6 +3131,54 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
     (
         alloyProperties_.lookup<label>("nSolidificationLoops")
     ),
+    solidificationIterationMode_
+    (
+        alloyProperties_.lookupOrDefault<word>
+        (
+            "solidificationIterationMode",
+            "fixed"
+        )
+    ),
+    minSolidificationIterations_
+    (
+        alloyProperties_.lookupOrDefault<label>
+        (
+            "minSolidificationIterations",
+            2
+        )
+    ),
+    maxSolidificationIterations_
+    (
+        alloyProperties_.lookupOrDefault<label>
+        (
+            "maxSolidificationIterations",
+            20
+        )
+    ),
+    temperatureCouplingTolerance_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "temperatureCouplingTolerance",
+            1e-3
+        )
+    ),
+    carbonCouplingTolerance_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "carbonCouplingTolerance",
+            1e-7
+        )
+    ),
+    solidFractionCouplingTolerance_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "solidFractionCouplingTolerance",
+            1e-5
+        )
+    ),
 
     g_
     (
@@ -3553,8 +3647,17 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << "    microsegregationModel = " << microsegregationModel_ << nl
         << "    speciesDiffusionForm  = " << speciesDiffusionForm_ << nl
         << "    VB alphaC       = " << vollerBeckermannAlphaC_ << nl
-        << "    solidification loops = "
-        << nSolidificationLoops_
+        << "    solidification iteration mode = "
+        << solidificationIterationMode_ << nl
+        << "    fixed solidification loops    = "
+        << nSolidificationLoops_ << nl
+        << "    min/max coupled iterations    = "
+        << minSolidificationIterations_ << " "
+        << maxSolidificationIterations_ << nl
+        << "    coupling tolerances (T,C,fs)  = "
+        << temperatureCouplingTolerance_ << " "
+        << carbonCouplingTolerance_ << " "
+        << solidFractionCouplingTolerance_
         << endl;
 
     mesh.schemes().setFluxRequired(p.name());
@@ -3837,6 +3940,20 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         )
      && diagnosticEnabled("coupling");
 
+    // CC10b nonlinear-iteration controller.
+    //
+    // "fixed" reproduces the pre-CC10b nSolidificationLoops behaviour.
+    // "converged" permits up to maxSolidificationIterations and stops only
+    // when the T, Carbon and fs max-norm changes all satisfy their tolerances.
+    // No under-relaxation is introduced in CC10b.
+    const bool convergenceControlled =
+        solidificationIterationMode_ == "converged";
+
+    const label iterationLimit =
+        convergenceControlled
+      ? maxSolidificationIterations_
+      : nSolidificationLoops_;
+
     if (energyDiagnosticsNow)
     {
         Info<< "Solidification/variable-property energy coupling" << nl
@@ -3855,11 +3972,14 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         << gMax(nutEnergy.primitiveField())/Prt_ << " m2/s" << nl
         << "    solidVelocity               = "
         << solidVelocity_ << " m/s" << nl
-            << "    loops = " << nSolidificationLoops_
-            << endl;
+        << "    iteration mode              = "
+        << solidificationIterationMode_ << nl
+        << "    iteration limit             = "
+        << iterationLimit
+        << endl;
     }
 
-    for (label corr = 0; corr < nSolidificationLoops_; ++corr)
+    for (label corr = 0; corr < iterationLimit; ++corr)
     {
         // CC10a: snapshot the coupled iterate before this fixed-point
         // correction. This is diagnostic-only and does not modify the
@@ -4063,7 +4183,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         // No field used by the solver is modified below.
 
         const bool finalThermalCorrection =
-            corr == nSolidificationLoops_ - 1;
+            corr == iterationLimit - 1;
 
         if (finalThermalCorrection && energyDiagnosticsNow)
         {
@@ -4359,7 +4479,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         // correction, audit the open-domain species balance immediately after
         // the solve and before phase-state re-closure changes the frozen fields.
         const bool finalLoop =
-            corr == nSolidificationLoops_ - 1;
+            corr == iterationLimit - 1;
 
         const scalar maxDeltaCarbon =
             solveSpeciesTransport(finalLoop);
@@ -4386,17 +4506,26 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         maxDeltaFsIter =
             returnReduce(maxDeltaFsIter, maxOp<scalar>());
 
+        const bool couplingConverged =
+            convergenceControlled
+         && corr + 1 >= minSolidificationIterations_
+         && maxDeltaTIter <= temperatureCouplingTolerance_
+         && maxDeltaCarbon <= carbonCouplingTolerance_
+         && maxDeltaFsIter <= solidFractionCouplingTolerance_;
+
         if (couplingDiagnosticsNow)
         {
             Info<< "COUPLING_DIAG"
                 << " time=" << runTime.value()
                 << " iter=" << corr + 1
-                << " loops=" << nSolidificationLoops_
+                << " limit=" << iterationLimit
+                << " mode=" << solidificationIterationMode_
                 << " dT=" << maxDeltaTIter
                 << " dCarbon=" << maxDeltaCarbon
                 << " dfs=" << maxDeltaFsIter
                 << " dfsThermal=" << maxDeltaFsThermal
                 << " dfsSpecies=" << maxDeltaFsSpecies
+                << " converged=" << couplingConverged
                 << endl;
         }
 
@@ -4408,7 +4537,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         if (energyDiagnosticsNow)
         {
             Info<< "    loop " << corr + 1
-                << "/" << nSolidificationLoops_ << nl
+                << "/" << iterationLimit << nl
                 << "        max |delta T|      = "
                 << maxDeltaTIter << " K" << nl
                 << "        max |CpT adv corr| = "
@@ -4417,6 +4546,36 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 << maxDeltaCarbon << nl
                 << "        max |delta fs|     = "
                 << maxDeltaFs
+                << endl;
+        }
+
+        if (couplingConverged)
+        {
+            // The detailed matrix-level energy/species audits are historically
+            // tied to a pre-known final correction. Do not re-solve or
+            // re-close fields merely for reporting after an early exit.
+            // Final-state field diagnostics are refreshed in postSolve().
+            Info<< "COUPLING_CONTROL"
+                << " time=" << runTime.value()
+                << " status=converged"
+                << " iterations=" << corr + 1
+                << " dT=" << maxDeltaTIter
+                << " dCarbon=" << maxDeltaCarbon
+                << " dfs=" << maxDeltaFsIter
+                << endl;
+
+            break;
+        }
+
+        if (convergenceControlled && finalLoop)
+        {
+            WarningInFunction
+                << "Nonlinear solidification coupling did not converge in "
+                << iterationLimit << " iterations at time "
+                << runTime.value() << "." << nl
+                << "    max |delta T|      = " << maxDeltaTIter << " K" << nl
+                << "    max |delta Carbon| = " << maxDeltaCarbon << nl
+                << "    max |delta fs|     = " << maxDeltaFsIter
                 << endl;
         }
     }

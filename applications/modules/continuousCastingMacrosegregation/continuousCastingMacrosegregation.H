@@ -192,8 +192,23 @@ protected:
         //  CC-2: used by moving-solid BKC momentum resistance
         vector solidVelocity_;
 
-        //- Number of fixed-point solidification/latent-heat coupling loops
+        //- Legacy fixed number of solidification/latent-heat coupling loops.
+        //  Used when solidificationIterationMode = fixed.
         label nSolidificationLoops_;
+
+        //- CC10b nonlinear solidification-coupling iteration mode:
+        //    fixed     : preserve nSolidificationLoops behaviour
+        //    converged : iterate until coupled-field tolerances are satisfied
+        word solidificationIterationMode_;
+
+        //- Minimum/maximum nonlinear iterations in converged mode
+        label minSolidificationIterations_;
+        label maxSolidificationIterations_;
+
+        //- Global max-norm convergence tolerances for the coupled iteration
+        scalar temperatureCouplingTolerance_;
+        scalar carbonCouplingTolerance_;
+        scalar solidFractionCouplingTolerance_;
 
         //- Gravitational acceleration read from constant/g
         uniformDimensionedVectorField g_;
