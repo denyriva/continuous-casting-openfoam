@@ -438,6 +438,24 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
             << solidFractionCouplingTolerance_
             << exit(FatalIOError);
     }
+
+    if
+    (
+        temperatureNonlinearRelaxation_ <= SMALL
+     || temperatureNonlinearRelaxation_ > 1.0
+     || speciesNonlinearRelaxation_ <= SMALL
+     || speciesNonlinearRelaxation_ > 1.0
+    )
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "CC10c nonlinear relaxation factors must satisfy "
+            << "0 < omega <= 1." << nl
+            << "    temperatureNonlinearRelaxation = "
+            << temperatureNonlinearRelaxation_ << nl
+            << "    speciesNonlinearRelaxation = "
+            << speciesNonlinearRelaxation_
+            << exit(FatalIOError);
+    }
 }
 
 
@@ -1786,6 +1804,12 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     }
 
     fvScalarMatrix& CarbonEqn = tCarbonEqn.ref();
+
+    // CC10c nonlinear equation under-relaxation.
+    //
+    // This acts on the current Carbon Picard equation, not on any physical
+    // diffusion/advection coefficient. omega_C=1 reproduces CC10b exactly.
+    CarbonEqn.relax(speciesNonlinearRelaxation_);
     CarbonEqn.solve();
 
     // -----------------------------------------------------------------
@@ -3179,6 +3203,22 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
             1e-5
         )
     ),
+    temperatureNonlinearRelaxation_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "temperatureNonlinearRelaxation",
+            1.0
+        )
+    ),
+    speciesNonlinearRelaxation_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "speciesNonlinearRelaxation",
+            1.0
+        )
+    ),
 
     g_
     (
@@ -3657,7 +3697,10 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << "    coupling tolerances (T,C,fs)  = "
         << temperatureCouplingTolerance_ << " "
         << carbonCouplingTolerance_ << " "
-        << solidFractionCouplingTolerance_
+        << solidFractionCouplingTolerance_ << nl
+        << "    nonlinear relaxation (T,C)    = "
+        << temperatureNonlinearRelaxation_ << " "
+        << speciesNonlinearRelaxation_
         << endl;
 
     mesh.schemes().setFluxRequired(p.name());
@@ -4156,6 +4199,11 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
           - tRelativeLatentAdvection()
         );
 
+        // CC10c nonlinear equation under-relaxation.
+        //
+        // This damps the segregated fixed-point update without changing the
+        // converged equation. omega_T=1 reproduces the CC10b matrix exactly.
+        TEqn.relax(temperatureNonlinearRelaxation_);
         TEqn.solve();
 
         // -----------------------------------------------------------------
@@ -4520,6 +4568,8 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 << " iter=" << corr + 1
                 << " limit=" << iterationLimit
                 << " mode=" << solidificationIterationMode_
+                << " omegaT=" << temperatureNonlinearRelaxation_
+                << " omegaC=" << speciesNonlinearRelaxation_
                 << " dT=" << maxDeltaTIter
                 << " dCarbon=" << maxDeltaCarbon
                 << " dfs=" << maxDeltaFsIter

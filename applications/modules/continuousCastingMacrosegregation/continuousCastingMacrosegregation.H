@@ -210,6 +210,11 @@ protected:
         scalar carbonCouplingTolerance_;
         scalar solidFractionCouplingTolerance_;
 
+        //- CC10c nonlinear equation under-relaxation factors.
+        //  A value of 1 preserves the unrelaxed CC10b equations.
+        scalar temperatureNonlinearRelaxation_;
+        scalar speciesNonlinearRelaxation_;
+
         //- Gravitational acceleration read from constant/g
         uniformDimensionedVectorField g_;
 
