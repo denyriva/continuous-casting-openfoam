@@ -3824,6 +3824,19 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
     const bool energyDiagnosticsNow =
         diagnosticEnabled("energy");
 
+    // CC10a nonlinear-coupling diagnostic.
+    //
+    // Keep this opt-in: diagnosticEnabled() defaults an unspecified named
+    // diagnostic to true, whereas CC10a must not change normal log volume
+    // unless explicitly requested in diagnosticsProperties.
+    const bool couplingDiagnosticsNow =
+        diagnosticsProperties_.lookupOrDefault<Switch>
+        (
+            "coupling",
+            false
+        )
+     && diagnosticEnabled("coupling");
+
     if (energyDiagnosticsNow)
     {
         Info<< "Solidification/variable-property energy coupling" << nl
@@ -3848,6 +3861,11 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 
     for (label corr = 0; corr < nSolidificationLoops_; ++corr)
     {
+        // CC10a: snapshot the coupled iterate before this fixed-point
+        // correction. This is diagnostic-only and does not modify the
+        // physical fields.
+        const scalarField fsBeforeIter(fs_.primitiveField());
+
         // Hybrid latent-storage linearisation.
         //
         // The total discrete phase change sought over the physical time step
@@ -4352,6 +4370,35 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 
         const scalar maxDeltaFs =
             max(maxDeltaFsThermal, maxDeltaFsSpecies);
+
+        scalar maxDeltaFsIter = 0.0;
+
+        forAll(fs_, celli)
+        {
+            maxDeltaFsIter =
+                max
+                (
+                    maxDeltaFsIter,
+                    mag(fs_[celli] - fsBeforeIter[celli])
+                );
+        }
+
+        maxDeltaFsIter =
+            returnReduce(maxDeltaFsIter, maxOp<scalar>());
+
+        if (couplingDiagnosticsNow)
+        {
+            Info<< "COUPLING_DIAG"
+                << " time=" << runTime.value()
+                << " iter=" << corr + 1
+                << " loops=" << nSolidificationLoops_
+                << " dT=" << maxDeltaTIter
+                << " dCarbon=" << maxDeltaCarbon
+                << " dfs=" << maxDeltaFsIter
+                << " dfsThermal=" << maxDeltaFsThermal
+                << " dfsSpecies=" << maxDeltaFsSpecies
+                << endl;
+        }
 
         if (finalLoop)
         {
