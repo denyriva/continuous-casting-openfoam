@@ -224,16 +224,15 @@ protected:
         scalar nonlinearResidualStallRatio_;
         label nonlinearResidualBadIterations_;
 
-        //- Coupling-driven physical time-step limiter. This does not rewind
-        //  an already failed step; instead it reduces the next physical step
-        //  after a nonlinear-coupling failure and relaxes the cap gradually
-        //  after a configurable number of successful coupled steps.
-        bool couplingTimeStepControl_;
-        scalar couplingFailureDeltaTFactor_;
-        scalar couplingRecoveryFactor_;
-        label couplingRecoverySuccessfulSteps_;
-        mutable scalar couplingDeltaTLimit_;
-        mutable label couplingSuccessfulStepsSinceFailure_;
+        //- Adaptive thermophysical physical-time subcycling. If the nonlinear
+        //  T-C-fs solve cannot converge over the full physical deltaT, restore
+        //  the thermophysical state and retry the SAME physical interval as
+        //  N equal substeps (1 -> factor -> factor^2 ... <= max). Momentum,
+        //  pressure and turbulence remain frozen during these internal
+        //  thermophysical substeps.
+        bool thermophysicalSubcycling_;
+        label maxThermophysicalSubcycles_;
+        label thermophysicalSubcycleFactor_;
 
         //- Gravitational acceleration read from constant/g
         uniformDimensionedVectorField g_;
@@ -447,7 +446,13 @@ protected:
         //  immediately after the solve, before phase-state re-closure changes
         //  CarbonL/CarbonS or the frozen diffusion coefficients.
         //  Returns the global maximum change in Carbon during this correction.
-        scalar solveSpeciesTransport(const bool report, const scalar nonlinearRelaxation = -1.0);
+        scalar solveSpeciesTransport
+        (
+            const bool report,
+            const scalar nonlinearRelaxation,
+            const scalar subDeltaT,
+            const volScalarField& CarbonSubOld
+        );
 
         //- Diagnose the relative contribution of temperature and mixture
         //  composition changes to Lever-rule solid-fraction evolution:

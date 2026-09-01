@@ -55,37 +55,26 @@ void Foam::solvers::continuousCastingMacrosegregation::continuityErrors()
 Foam::scalar
 Foam::solvers::continuousCastingMacrosegregation::maxDeltaT() const
 {
-    scalar deltaT = vGreat;
-
     if (!pseudoSteadyEnabled_)
     {
-        deltaT = basicFluidSolver::maxDeltaT();
+        return basicFluidSolver::maxDeltaT();
     }
-    else
+
+    scalar deltaT =
+        min
+        (
+            fvModels().maxDeltaT(),
+            min(pseudoDeltaTTarget_, pseudoMaxDeltaT_)
+        );
+
+    if (pseudoMaxCo_ < vGreat && CoNum > small)
     {
         deltaT =
             min
             (
-                fvModels().maxDeltaT(),
-                min(pseudoDeltaTTarget_, pseudoMaxDeltaT_)
+                deltaT,
+                pseudoMaxCo_/CoNum*runTime.deltaTValue()
             );
-
-        if (pseudoMaxCo_ < vGreat && CoNum > small)
-        {
-            deltaT =
-                min
-                (
-                    deltaT,
-                    pseudoMaxCo_/CoNum*runTime.deltaTValue()
-                );
-        }
-    }
-
-    // CC10d: after a failed nonlinear T-C-fs closure, constrain the next
-    // physical time step independently of the Courant-number controller.
-    if (couplingTimeStepControl_ && couplingDeltaTLimit_ < 0.5*vGreat)
-    {
-        deltaT = min(deltaT, couplingDeltaTLimit_);
     }
 
     return deltaT;
@@ -1139,10 +1128,6 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
      || nonlinearResidualStallRatio_ <= SMALL
      || nonlinearResidualStallRatio_ > 1.0
      || nonlinearResidualBadIterations_ < 1
-     || couplingFailureDeltaTFactor_ <= SMALL
-     || couplingFailureDeltaTFactor_ >= 1.0
-     || couplingRecoveryFactor_ <= 1.0
-     || couplingRecoverySuccessfulSteps_ < 1
     )
     {
         FatalIOErrorInFunction(alloyProperties_)
@@ -1163,13 +1148,24 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
             << "    nonlinearResidualStallRatio = "
             << nonlinearResidualStallRatio_ << nl
             << "    nonlinearResidualBadIterations = "
-            << nonlinearResidualBadIterations_ << nl
-            << "    couplingFailureDeltaTFactor = "
-            << couplingFailureDeltaTFactor_ << nl
-            << "    couplingRecoveryFactor = "
-            << couplingRecoveryFactor_ << nl
-            << "    couplingRecoverySuccessfulSteps = "
-            << couplingRecoverySuccessfulSteps_
+            << nonlinearResidualBadIterations_
+            << exit(FatalIOError);
+    }
+
+    if
+    (
+        maxThermophysicalSubcycles_ < 1
+     || thermophysicalSubcycleFactor_ < 2
+    )
+    {
+        FatalIOErrorInFunction(alloyProperties_)
+            << "Invalid thermophysical subcycling controls." << nl
+            << "Require maxThermophysicalSubcycles >= 1 and "
+            << "thermophysicalSubcycleFactor >= 2." << nl
+            << "    maxThermophysicalSubcycles = "
+            << maxThermophysicalSubcycles_ << nl
+            << "    thermophysicalSubcycleFactor = "
+            << thermophysicalSubcycleFactor_
             << exit(FatalIOError);
     }
 }
@@ -2223,7 +2219,9 @@ Foam::scalar
 Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
 (
     const bool report,
-    const scalar nonlinearRelaxation
+    const scalar nonlinearRelaxation,
+    const scalar subDeltaT,
+    const volScalarField& CarbonSubOld
 )
 {
     // Bennon-Incropera mixture species equation used by the paper, Eq. (19):
@@ -2293,6 +2291,21 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     // not the continuous species equation.
 
     updateSpeciesDiagnostics(false);
+
+    if (subDeltaT <= SMALL)
+    {
+        FatalErrorInFunction
+            << "Non-positive thermophysical substep: " << subDeltaT
+            << abort(FatalError);
+    }
+
+    const dimensionedScalar rDeltaTSpecies
+    (
+        "rDeltaTSpecies",
+        dimless/dimTime,
+        1.0/subDeltaT
+    );
+
 
     const dimensionedScalar DLDim
     (
@@ -2504,11 +2517,12 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     {
         tCarbonEqn =
         (
-            fvm::ddt(Carbon_)
+            fvm::Sp(rDeltaTSpecies, Carbon_)
           + fvm::div(phi_, Carbon_, "div(phi,Carbon)")
           - fvm::laplacian(phaseLinearizedDiffusivity, Carbon_)
          ==
-            tLiquidPhaseLinearizedCorrection()
+            rDeltaTSpecies*CarbonSubOld
+          + tLiquidPhaseLinearizedCorrection()
           + tSolidPhaseLinearizedCorrection()
           - fvc::div
             (
@@ -2522,11 +2536,12 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     {
         tCarbonEqn =
         (
-            fvm::ddt(Carbon_)
+            fvm::Sp(rDeltaTSpecies, Carbon_)
           + fvm::div(phi_, Carbon_, "div(phi,Carbon)")
           - fvm::laplacian(speciesDiffusivity_, Carbon_)
          ==
-            fvc::laplacian
+            rDeltaTSpecies*CarbonSubOld
+          + fvc::laplacian
             (
                 liquidFraction*effectiveLiquidDiffusivity,
                 CarbonL_ - Carbon_
@@ -2585,7 +2600,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     if (globalMinCarbon < 0.0015)
     {
         const scalar rDeltaTFailure =
-            1.0/runTime.deltaTValue();
+            1.0/subDeltaT;
 
         const volScalarField failureStorage
         (
@@ -2598,7 +2613,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
                 IOobject::NO_WRITE,
                 false
             ),
-            rDeltaTFailure*(Carbon_ - Carbon_.oldTime())
+            rDeltaTFailure*(Carbon_ - CarbonSubOld)
         );
 
         const tmp<volScalarField> tFailureBulkAdvection =
@@ -2730,7 +2745,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
 
             Pout<< "CARBON_FAILURE_DIAG"
                 << " time=" << runTime.value()
-                << " dt=" << runTime.deltaTValue()
+                << " dt=" << subDeltaT
                 << " proc=" << Pstream::myProcNo()
                 << " cell=" << celli
                 << " Ccoord=" << mesh_.C()[celli]
@@ -2800,7 +2815,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
         // reconstruct the Euler storage term explicitly from the current
         // time-step size.
         const scalar rDeltaTSpecies =
-            1.0/runTime.deltaTValue();
+            1.0/subDeltaT;
 
         const volScalarField speciesStorage
         (
@@ -2813,7 +2828,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
                 IOobject::NO_WRITE,
                 false
             ),
-            rDeltaTSpecies*(Carbon_ - Carbon_.oldTime())
+            rDeltaTSpecies*(Carbon_ - CarbonSubOld)
         );
 
         const tmp<volScalarField> tBulkSpeciesAdvection =
@@ -2936,7 +2951,7 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
                 IOobject::NO_WRITE
             ),
             rhoRDeltaTSpeciesDiagnostic
-           *(Carbon_ - Carbon_.oldTime())
+           *(Carbon_ - CarbonSubOld)
         );
 
         volScalarField carbonBulkAdvection
@@ -4014,40 +4029,30 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
             2
         )
     ),
-    couplingTimeStepControl_
+    thermophysicalSubcycling_
     (
         alloyProperties_.lookupOrDefault<bool>
         (
-            "couplingTimeStepControl",
+            "thermophysicalSubcycling",
             true
         )
     ),
-    couplingFailureDeltaTFactor_
-    (
-        alloyProperties_.lookupOrDefault<scalar>
-        (
-            "couplingFailureDeltaTFactor",
-            0.5
-        )
-    ),
-    couplingRecoveryFactor_
-    (
-        alloyProperties_.lookupOrDefault<scalar>
-        (
-            "couplingRecoveryFactor",
-            1.2
-        )
-    ),
-    couplingRecoverySuccessfulSteps_
+    maxThermophysicalSubcycles_
     (
         alloyProperties_.lookupOrDefault<label>
         (
-            "couplingRecoverySuccessfulSteps",
-            5
+            "maxThermophysicalSubcycles",
+            8
         )
     ),
-    couplingDeltaTLimit_(vGreat),
-    couplingSuccessfulStepsSinceFailure_(0),
+    thermophysicalSubcycleFactor_
+    (
+        alloyProperties_.lookupOrDefault<label>
+        (
+            "thermophysicalSubcycleFactor",
+            2
+        )
+    ),
 
     g_
     (
@@ -4539,14 +4544,12 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << nonlinearResidualStallRatio_ << nl
         << "    adaptive bad-iteration count  = "
         << nonlinearResidualBadIterations_ << nl
-        << "    coupling time-step control    = "
-        << couplingTimeStepControl_ << nl
-        << "    coupling dt failure factor    = "
-        << couplingFailureDeltaTFactor_ << nl
-        << "    coupling dt recovery factor   = "
-        << couplingRecoveryFactor_ << nl
-        << "    coupling recovery successes   = "
-        << couplingRecoverySuccessfulSteps_
+        << "    thermophysical subcycling     = "
+        << thermophysicalSubcycling_ << nl
+        << "    max thermophysical subcycles  = "
+        << maxThermophysicalSubcycles_ << nl
+        << "    thermophysical subcycle factor= "
+        << thermophysicalSubcycleFactor_
         << endl;
 
     mesh.schemes().setFluxRequired(p.name());
@@ -4707,21 +4710,14 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         latentHeat_
     );
 
-    const scalar deltaTValue = runTime.deltaTValue();
+    const scalar physicalDeltaTValue = runTime.deltaTValue();
 
-    if (deltaTValue <= SMALL)
+    if (physicalDeltaTValue <= SMALL)
     {
         FatalErrorInFunction
-            << "Non-positive time step: " << deltaTValue
+            << "Non-positive physical time step: " << physicalDeltaTValue
             << abort(FatalError);
     }
-
-    const dimensionedScalar rDeltaT
-    (
-        "rDeltaT",
-        dimless/dimTime,
-        1.0/deltaTValue
-    );
 
     // Preserve previous physical-time algebraic fields while their current
     // values are changed during the inner solidification iterations.
@@ -4729,6 +4725,63 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
     // energy-conservation audit.
     CpMix_.oldTime();
     fs_.oldTime();
+
+    // -----------------------------------------------------------------
+    // Thermophysical physical-time subcycling checkpoint.
+    //
+    // The global OpenFOAM Time object is NOT advanced internally.  If the
+    // nonlinear T-C-fs solve fails over the full physical deltaT, only the
+    // thermophysical fields are restored and the same physical interval is
+    // retried as 2, 4, ... equal thermophysical substeps.  Momentum, phi,
+    // pressure and turbulence stay frozen exactly as they already do during
+    // the nonlinear Picard loop.
+    const scalarField TPhysicalStart(T_.primitiveField());
+    const scalarField CarbonPhysicalStart(Carbon_.primitiveField());
+    const scalarField fsPhysicalStart(fs_.primitiveField());
+    const scalarField CarbonLPhysicalStart(CarbonL_.primitiveField());
+    const scalarField CarbonSPhysicalStart(CarbonS_.primitiveField());
+    const scalarField CarbonSIPhysicalStart(CarbonSInterface_.primitiveField());
+    const scalarField betaPhysicalStart(backDiffusionCoefficient_.primitiveField());
+    const scalarField speciesDiffPhysicalStart(speciesDiffusivity_.primitiveField());
+    const scalarField liquidAdvPhysicalStart(liquidAdvectionFactor_.primitiveField());
+    const scalarField macrosegPhysicalStart(macrosegregation_.primitiveField());
+    const scalarField CpMixPhysicalStart(CpMix_.primitiveField());
+    const scalarField kEffPhysicalStart(kEff_.primitiveField());
+    const scalarField dfsdTPhysicalStart(dfsdT_.primitiveField());
+    const scalarField CpAppPhysicalStart(CpApp_.primitiveField());
+
+    auto restoreThermophysicalState = [&]()
+    {
+        T_.primitiveFieldRef() = TPhysicalStart;
+        Carbon_.primitiveFieldRef() = CarbonPhysicalStart;
+        fs_.primitiveFieldRef() = fsPhysicalStart;
+        CarbonL_.primitiveFieldRef() = CarbonLPhysicalStart;
+        CarbonS_.primitiveFieldRef() = CarbonSPhysicalStart;
+        CarbonSInterface_.primitiveFieldRef() = CarbonSIPhysicalStart;
+        backDiffusionCoefficient_.primitiveFieldRef() = betaPhysicalStart;
+        speciesDiffusivity_.primitiveFieldRef() = speciesDiffPhysicalStart;
+        liquidAdvectionFactor_.primitiveFieldRef() = liquidAdvPhysicalStart;
+        macrosegregation_.primitiveFieldRef() = macrosegPhysicalStart;
+        CpMix_.primitiveFieldRef() = CpMixPhysicalStart;
+        kEff_.primitiveFieldRef() = kEffPhysicalStart;
+        dfsdT_.primitiveFieldRef() = dfsdTPhysicalStart;
+        CpApp_.primitiveFieldRef() = CpAppPhysicalStart;
+
+        T_.correctBoundaryConditions();
+        Carbon_.correctBoundaryConditions();
+        fs_.correctBoundaryConditions();
+        CarbonL_.correctBoundaryConditions();
+        CarbonS_.correctBoundaryConditions();
+        CarbonSInterface_.correctBoundaryConditions();
+        backDiffusionCoefficient_.correctBoundaryConditions();
+        speciesDiffusivity_.correctBoundaryConditions();
+        liquidAdvectionFactor_.correctBoundaryConditions();
+        macrosegregation_.correctBoundaryConditions();
+        CpMix_.correctBoundaryConditions();
+        kEff_.correctBoundaryConditions();
+        dfsdT_.correctBoundaryConditions();
+        CpApp_.correctBoundaryConditions();
+    };
 
     const dimensionedVector solidVelocityDim
     (
@@ -4843,11 +4896,134 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
       ? maxSolidificationIterations_
       : nSolidificationLoops_;
 
-    scalar omegaTCurrent = temperatureNonlinearRelaxation_;
-    scalar omegaCCurrent = speciesNonlinearRelaxation_;
-    scalar omegaFsCurrent = solidFractionNonlinearRelaxation_;
-    scalar previousNormalizedResidual = GREAT;
-    label consecutiveBadResiduals = 0;
+    label nThermoSubcycles = 1;
+
+    while (true)
+    {
+        if (nThermoSubcycles > 1)
+        {
+            restoreThermophysicalState();
+        }
+
+        const scalar subDeltaTValue =
+            physicalDeltaTValue/scalar(nThermoSubcycles);
+
+        const dimensionedScalar rDeltaT
+        (
+            "rDeltaTThermoSubcycle",
+            dimless/dimTime,
+            1.0/subDeltaTValue
+        );
+
+        // IMPORTANT: these are local history carriers, not physical fields.
+        // Do NOT clone T_/Carbon_/... directly here.  In particular, cloning
+        // T_ also clones its codedMixed patch fields.  codedMixed contains a
+        // dynamic-code redirect object tied to the original registered field;
+        // cloning it onto an unregistered temporary can invalidate that
+        // redirect and segfault when the real T boundary is next updated by
+        // fvm::laplacian().  Use plain calculated temporary patch fields and
+        // copy only the cell values required by the local transient terms.
+        volScalarField TSubOld
+        (
+            IOobject
+            (
+                "TSubOldTmp",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE,
+                false
+            ),
+            mesh_,
+            dimensionedScalar("zero", T_.dimensions(), 0.0)
+        );
+        TSubOld.primitiveFieldRef() = T_.primitiveField();
+
+        volScalarField CarbonSubOld
+        (
+            IOobject
+            (
+                "CarbonSubOldTmp",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE,
+                false
+            ),
+            mesh_,
+            dimensionedScalar("zero", Carbon_.dimensions(), 0.0)
+        );
+        CarbonSubOld.primitiveFieldRef() = Carbon_.primitiveField();
+
+        volScalarField fsSubOld
+        (
+            IOobject
+            (
+                "fsSubOldTmp",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE,
+                false
+            ),
+            mesh_,
+            dimensionedScalar("zero", fs_.dimensions(), 0.0)
+        );
+        fsSubOld.primitiveFieldRef() = fs_.primitiveField();
+
+        volScalarField CpMixSubOld
+        (
+            IOobject
+            (
+                "CpMixSubOldTmp",
+                runTime.name(),
+                mesh_,
+                IOobject::NO_READ,
+                IOobject::NO_WRITE,
+                false
+            ),
+            mesh_,
+            dimensionedScalar("zero", CpMix_.dimensions(), 0.0)
+        );
+        CpMixSubOld.primitiveFieldRef() = CpMix_.primitiveField();
+
+        bool attemptConverged = true;
+
+        Info<< "COUPLING_SUBCYCLE"
+            << " time=" << runTime.value()
+            << " action=attempt"
+            << " nSub=" << nThermoSubcycles
+            << " dtPhysical=" << physicalDeltaTValue
+            << " dtThermo=" << subDeltaTValue
+            << endl;
+
+        for (label thermoSub = 0; thermoSub < nThermoSubcycles; ++thermoSub)
+        {
+            // Refresh the Dong fully-liquid turbulence switch at the start of
+            // every physical thermophysical substep.
+            forAll(fullyLiquidEnergy, celli)
+            {
+                fullyLiquidEnergy[celli] =
+                    (fs_[celli] <= SMALL ? 1.0 : 0.0);
+            }
+            forAll(fullyLiquidEnergy.boundaryField(), patchi)
+            {
+                scalarField& maskp =
+                    fullyLiquidEnergy.boundaryFieldRef()[patchi];
+                const fvPatchScalarField& fsp = fs_.boundaryField()[patchi];
+                forAll(maskp, facei)
+                {
+                    maskp[facei] =
+                        (fsp[facei] <= SMALL ? 1.0 : 0.0);
+                }
+            }
+
+            scalar omegaTCurrent = temperatureNonlinearRelaxation_;
+            scalar omegaCCurrent = speciesNonlinearRelaxation_;
+            scalar omegaFsCurrent = solidFractionNonlinearRelaxation_;
+            scalar previousNormalizedResidual = GREAT;
+            label consecutiveBadResiduals = 0;
+            bool substepConverged = false;
 
     if (energyDiagnosticsNow)
     {
@@ -4911,8 +5087,8 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             -latentHeatDim*dfsdT_;
 
         const tmp<volScalarField> tPhaseResidual =
-            (fs_ - fs_.oldTime())
-          - dfsdT_*(T_ - T_.oldTime());
+            (fs_ - fsSubOld)
+          - dfsdT_*(T_ - TSubOld);
 
         const tmp<volScalarField> tResidualLatentSource =
             latentHeatDim*rDeltaT*tPhaseResidual();
@@ -5039,12 +5215,13 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
 
         fvScalarMatrix TEqn
         (
-            fvm::ddt(CpMix_, T_)
+            fvm::Sp(rDeltaT*CpMix_, T_)
           + fvm::Sp(rDeltaT*tLatentCp(), T_)
           + fvm::div(phiCp, T_, "div(phi,T)")
           - fvm::laplacian(tKbyRho(), T_)
          ==
-            rDeltaT*tLatentCp()*T_.oldTime()
+            rDeltaT*CpMixSubOld*TSubOld
+          + rDeltaT*tLatentCp()*TSubOld
           + tResidualLatentSource()
           - tEnergyAdvectionCorrection()
           + tBulkLatentAdvection()
@@ -5089,7 +5266,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         {
             // Foundation v14 has no fvc::ddt(CpMix_, T_) overload.
             // For this fixed mesh with Euler time integration, the explicit
-            // diagnostic equivalent of fvm::ddt(CpMix_, T_) is
+            // diagnostic equivalent of fvm::Sp(rDeltaT*CpMix_, T_) is
             //
             //   rDeltaT*(Cp*T - Cp.oldTime()*T.oldTime()).
             //
@@ -5098,7 +5275,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 rDeltaT
                *(
                     CpMix_*T_
-                  - CpMix_.oldTime()*T_.oldTime()
+                  - CpMixSubOld*TSubOld
                 );
 
             // Hybrid latent storage exactly matching TEqn:
@@ -5108,7 +5285,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             // Since tLatentCp = -L*dfs/dT, the first contribution is
             // +tLatentCp*(T-Told)/dt on the left-hand side.
             const tmp<volScalarField> tDiscreteLatentStorage =
-                rDeltaT*tLatentCp()*(T_ - T_.oldTime())
+                rDeltaT*tLatentCp()*(T_ - TSubOld)
               - latentHeatDim*rDeltaT*tPhaseResidual();
 
             const tmp<volScalarField> tDiscreteSplitAdvection =
@@ -5393,7 +5570,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             corr == iterationLimit - 1;
 
         const scalar maxDeltaCarbon =
-            solveSpeciesTransport(finalLoop, omegaCCurrent);
+            solveSpeciesTransport(finalLoop, omegaCCurrent, subDeltaTValue, CarbonSubOld);
 
         scalar localMaxDeltaCarbon = -GREAT;
         label localMaxDeltaCarbonCell = -1;
@@ -5669,87 +5846,107 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             // tied to a pre-known final correction. Do not re-solve or
             // re-close fields merely for reporting after an early exit.
             // Final-state field diagnostics are refreshed in postSolve().
+            substepConverged = true;
+
             Info<< "COUPLING_CONTROL"
                 << " time=" << runTime.value()
                 << " status=converged"
+                << " thermoSub=" << thermoSub + 1 << "/" << nThermoSubcycles
+                << " dtThermo=" << subDeltaTValue
                 << " iterations=" << corr + 1
                 << " dT=" << maxDeltaTIter
                 << " dCarbon=" << maxDeltaCarbon
                 << " dfs=" << maxDeltaFsIter
                 << endl;
 
-            if
-            (
-                couplingTimeStepControl_
-             && couplingDeltaTLimit_ < 0.5*vGreat
-            )
-            {
-                ++couplingSuccessfulStepsSinceFailure_;
-
-                if
-                (
-                    couplingSuccessfulStepsSinceFailure_
-                 >= couplingRecoverySuccessfulSteps_
-                )
-                {
-                    const scalar oldLimit = couplingDeltaTLimit_;
-                    couplingDeltaTLimit_ *= couplingRecoveryFactor_;
-                    couplingSuccessfulStepsSinceFailure_ = 0;
-
-                    Info<< "COUPLING_DT_CONTROL"
-                        << " time=" << runTime.value()
-                        << " action=recover"
-                        << " dtLimit=" << oldLimit
-                        << "->" << couplingDeltaTLimit_
-                        << endl;
-                }
-            }
-
             break;
         }
 
         if (convergenceControlled && finalLoop)
         {
-            WarningInFunction
-                << "Nonlinear solidification coupling did not converge in "
-                << iterationLimit << " iterations at time "
-                << runTime.value() << "." << nl
-                << "    max |delta T|      = " << maxDeltaTIter << " K" << nl
-                << "    max |delta Carbon| = " << maxDeltaCarbon << nl
-                << "    max |delta fs|     = " << maxDeltaFsIter
+            Info<< "COUPLING_SUBCYCLE"
+                << " time=" << runTime.value()
+                << " action=substep-failed"
+                << " thermoSub=" << thermoSub + 1 << "/" << nThermoSubcycles
+                << " nSub=" << nThermoSubcycles
+                << " dtThermo=" << subDeltaTValue
+                << " iterations=" << iterationLimit
+                << " dT=" << maxDeltaTIter
+                << " dCarbon=" << maxDeltaCarbon
+                << " dfs=" << maxDeltaFsIter
                 << endl;
-
-            if (couplingTimeStepControl_)
-            {
-                const scalar oldLimit = couplingDeltaTLimit_;
-                const scalar failedStepLimit =
-                    couplingFailureDeltaTFactor_*runTime.deltaTValue();
-
-                couplingDeltaTLimit_ =
-                    min(couplingDeltaTLimit_, failedStepLimit);
-
-                couplingSuccessfulStepsSinceFailure_ = 0;
-
-                Info<< "COUPLING_DT_CONTROL"
-                    << " time=" << runTime.value()
-                    << " action=reduce-next-step"
-                    << " currentDt=" << runTime.deltaTValue()
-                    << " dtLimit=";
-
-                if (oldLimit < 0.5*vGreat)
-                {
-                    Info<< oldLimit;
-                }
-                else
-                {
-                    Info<< "unlimited";
-                }
-
-                Info<< "->" << couplingDeltaTLimit_
-                    << " factor=" << couplingFailureDeltaTFactor_
-                    << endl;
-            }
         }
+    }
+
+            // Legacy fixed-loop mode has no convergence test by definition.
+            // Preserve its historical behavior: completion of the requested
+            // number of corrections constitutes a successful substep.
+            if (!convergenceControlled)
+            {
+                substepConverged = true;
+            }
+
+            if (!substepConverged)
+            {
+                attemptConverged = false;
+                break;
+            }
+
+            // Advance ONLY the local thermophysical time history after a
+            // successfully converged substep. The OpenFOAM global oldTime()
+            // fields remain untouched until the physical timestep completes.
+            TSubOld = T_;
+            CarbonSubOld = Carbon_;
+            fsSubOld = fs_;
+            CpMixSubOld = CpMix_;
+        }
+
+        if (attemptConverged)
+        {
+            Info<< "COUPLING_SUBCYCLE"
+                << " time=" << runTime.value()
+                << " action=accepted"
+                << " nSub=" << nThermoSubcycles
+                << " dtPhysical=" << physicalDeltaTValue
+                << " dtThermo=" << subDeltaTValue
+                << endl;
+            return;
+        }
+
+        const label nextSubcycles =
+            nThermoSubcycles*thermophysicalSubcycleFactor_;
+
+        if
+        (
+            !thermophysicalSubcycling_
+         || nextSubcycles > maxThermophysicalSubcycles_
+        )
+        {
+            restoreThermophysicalState();
+
+            FatalErrorInFunction
+                << "Thermophysical nonlinear coupling failed and the "
+                << "physical timestep will NOT be accepted." << nl
+                << "    time                  = " << runTime.value() << nl
+                << "    physical deltaT       = " << physicalDeltaTValue << nl
+                << "    attempted subcycles   = " << nThermoSubcycles << nl
+                << "    max allowed subcycles = "
+                << maxThermophysicalSubcycles_ << nl
+                << "Increase maxThermophysicalSubcycles only after checking "
+                << "the coupling diagnostics."
+                << abort(FatalError);
+        }
+
+        Info<< "COUPLING_SUBCYCLE"
+            << " time=" << runTime.value()
+            << " action=restore-and-retry"
+            << " failedNSub=" << nThermoSubcycles
+            << " retryNSub=" << nextSubcycles
+            << " retryDtThermo="
+            << physicalDeltaTValue/scalar(nextSubcycles)
+            << endl;
+
+        nThermoSubcycles = nextSubcycles;
     }
 }
 
