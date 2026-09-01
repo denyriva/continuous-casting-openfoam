@@ -214,6 +214,26 @@ protected:
         //  A value of 1 preserves the unrelaxed CC10b equations.
         scalar temperatureNonlinearRelaxation_;
         scalar speciesNonlinearRelaxation_;
+        scalar solidFractionNonlinearRelaxation_;
+
+        //- Adaptive nonlinear-relaxation controller for difficult
+        //  solidification-coupling steps.
+        bool adaptiveNonlinearRelaxation_;
+        scalar minimumNonlinearRelaxation_;
+        scalar nonlinearRelaxationReductionFactor_;
+        scalar nonlinearResidualStallRatio_;
+        label nonlinearResidualBadIterations_;
+
+        //- Coupling-driven physical time-step limiter. This does not rewind
+        //  an already failed step; instead it reduces the next physical step
+        //  after a nonlinear-coupling failure and relaxes the cap gradually
+        //  after a configurable number of successful coupled steps.
+        bool couplingTimeStepControl_;
+        scalar couplingFailureDeltaTFactor_;
+        scalar couplingRecoveryFactor_;
+        label couplingRecoverySuccessfulSteps_;
+        mutable scalar couplingDeltaTLimit_;
+        mutable label couplingSuccessfulStepsSinceFailure_;
 
         //- Gravitational acceleration read from constant/g
         uniformDimensionedVectorField g_;
@@ -388,7 +408,7 @@ protected:
         //
         //  Returns the global maximum change in fs from the previous
         //  iteration.  If report=true, prints the full phase-state audit.
-        scalar updatePhaseState(const bool report);
+        scalar updatePhaseState(const bool report, const scalar phaseRelaxation = 1.0);
 
         //- Update thermo-solutal Boussinesq accelerations and diagnostics
         void updateBuoyancy();
@@ -401,13 +421,33 @@ protected:
         //  optionally, print the global solute-conservation audit.
         void updateSpeciesDiagnostics(const bool report);
 
+        //- Return the processor-local cell nearest wallCarbonTarget.
+        //  Returns -1 on every processor except the processor owning the
+        //  globally nearest cell. Diagnostic only.
+        label wallCarbonAuditCell() const;
+
+        //- Print the accepted physical-time-step state of the selected
+        //  wall-adjacent cell. Diagnostic only.
+        void updateWallCarbonHistoryDiagnostics() const;
+
+        //- Reconstruct the local physical terms of the Dong/Bennon-Incropera
+        //  species equation at the selected wall-adjacent cell. Diagnostic
+        //  only; does not alter any solved field or matrix.
+        void updateWallCarbonFluxDiagnostics() const;
+
+        //- Print a face-by-face audit of the liquid diffusion coefficient
+        //  around the selected wall cell, comparing the actual linear face
+        //  interpolation with a hypothetical harmonic interpolation.
+        //  Diagnostic only; does not alter the species equation.
+        void updateWallCarbonFaceDiagnostics() const;
+
         //- Solve the Bennon-Incropera mixture species equation with the
         //  moving-solid relative-advection term based on U-us.
         //  If report=true, print the CC-9 open-domain/discrete species audit
         //  immediately after the solve, before phase-state re-closure changes
         //  CarbonL/CarbonS or the frozen diffusion coefficients.
         //  Returns the global maximum change in Carbon during this correction.
-        scalar solveSpeciesTransport(const bool report);
+        scalar solveSpeciesTransport(const bool report, const scalar nonlinearRelaxation = -1.0);
 
         //- Diagnose the relative contribution of temperature and mixture
         //  composition changes to Lever-rule solid-fraction evolution:

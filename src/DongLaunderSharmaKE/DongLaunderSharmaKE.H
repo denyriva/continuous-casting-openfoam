@@ -1,5 +1,5 @@
 /*---------------------------------------------------------------------------*\
-  DongLaunderSharmaKE v3 diagnostic
+  DongLaunderSharmaKE v4 corrected Dong damping
   OpenFOAM Foundation v14-compatible custom RAS model.
 
   Base:
@@ -7,7 +7,7 @@
 
   Dong-style solidification damping:
       a_turb = nu * (180/lambda2^2)
-               * (1 - fl^2)/(fl^3 + xi)
+               * (1 - fl)^2/(fl^3 + xi)
 
       S_k       = sign * scale * a_turb * k
       S_epsilon = sign * scale * a_turb * epsilon
@@ -34,7 +34,8 @@ class DongLaunderSharmaKE
     typedef LaunderSharmaKE<BasicMomentumTransportModel> Base;
 
     scalar solidificationSourceSign_;
-    scalar solidificationSourceScale_;
+    scalar kSolidificationSourceScale_;
+    scalar epsilonSolidificationSourceScale_;
     scalar lambda2_;
     scalar solidificationXi_;
     word solidFractionFieldName_;
@@ -79,7 +80,7 @@ class DongLaunderSharmaKE
         return
             this->nu()
            *Am
-           *(scalar(1) - sqr(fl))
+           *sqr(scalar(1) - fl)
            /(pow3(fl) + solidificationXi_);
     }
 
@@ -91,7 +92,7 @@ protected:
         tmp<fvScalarMatrix> tSource = Base::kSource();
 
         if (mag(solidificationSourceSign_) <= SMALL
-         || solidificationSourceScale_ <= SMALL)
+         || kSolidificationSourceScale_ <= SMALL)
         {
             return tSource;
         }
@@ -104,7 +105,7 @@ protected:
                 fvm::Sp
                 (
                     (-solidificationSourceSign_)
-                   *solidificationSourceScale_
+                   *kSolidificationSourceScale_
                    *tRate(),
                     this->k_
                 );
@@ -115,7 +116,7 @@ protected:
                 fvm::Sp
                 (
                     solidificationSourceSign_
-                   *solidificationSourceScale_
+                   *kSolidificationSourceScale_
                    *tRate(),
                     this->k_
                 );
@@ -130,7 +131,7 @@ protected:
         tmp<fvScalarMatrix> tSource = Base::epsilonSource();
 
         if (mag(solidificationSourceSign_) <= SMALL
-         || solidificationSourceScale_ <= SMALL)
+         || epsilonSolidificationSourceScale_ <= SMALL)
         {
             return tSource;
         }
@@ -143,7 +144,7 @@ protected:
                 fvm::Sp
                 (
                     (-solidificationSourceSign_)
-                   *solidificationSourceScale_
+                   *epsilonSolidificationSourceScale_
                    *tRate(),
                     this->epsilon_
                 );
@@ -154,7 +155,7 @@ protected:
                 fvm::Sp
                 (
                     solidificationSourceSign_
-                   *solidificationSourceScale_
+                   *epsilonSolidificationSourceScale_
                    *tRate(),
                     this->epsilon_
                 );
@@ -193,12 +194,29 @@ public:
             )
         ),
 
-        solidificationSourceScale_
+        kSolidificationSourceScale_
         (
             this->typeDict(type).template lookupOrDefault<scalar>
             (
-                "solidificationSourceScale",
-                1.0
+                "kSolidificationSourceScale",
+                this->typeDict(type).template lookupOrDefault<scalar>
+                (
+                    "solidificationSourceScale",
+                    1.0
+                )
+            )
+        ),
+
+        epsilonSolidificationSourceScale_
+        (
+            this->typeDict(type).template lookupOrDefault<scalar>
+            (
+                "epsilonSolidificationSourceScale",
+                this->typeDict(type).template lookupOrDefault<scalar>
+                (
+                    "solidificationSourceScale",
+                    1.0
+                )
             )
         ),
 
@@ -263,12 +281,14 @@ public:
                 << exit(FatalError);
         }
 
-        Info<< "DongLaunderSharmaKE v2:" << nl
+        Info<< "DongLaunderSharmaKE v4 corrected Dong damping:" << nl
             << "    base model               = LaunderSharmaKE" << nl
             << "    solidification sign      = "
             << solidificationSourceSign_ << nl
-            << "    solidification scale     = "
-            << solidificationSourceScale_ << nl
+            << "    k solidification scale   = "
+            << kSolidificationSourceScale_ << nl
+            << "    epsilon solidif. scale   = "
+            << epsilonSolidificationSourceScale_ << nl
             << "    lambda2                  = "
             << lambda2_ << " m" << nl
             << "    solidificationXi         = "
@@ -280,7 +300,7 @@ public:
             << "    nut diagnostic floor     = "
             << nutDiagnosticFloor_ << " m2/s" << nl
             << "    damping form             = "
-            << "nu*(180/lambda2^2)*(1-fl^2)/(fl^3+xi)"
+            << "nu*(180/lambda2^2)*(1-fl)^2/(fl^3+xi)"
             << endl;
     }
 
@@ -426,11 +446,25 @@ public:
                 solidificationSourceSign_
             );
 
-        solidificationSourceScale_ =
+        const scalar legacySolidificationSourceScale =
             coeffs.template lookupOrDefault<scalar>
             (
                 "solidificationSourceScale",
-                solidificationSourceScale_
+                1.0
+            );
+
+        kSolidificationSourceScale_ =
+            coeffs.template lookupOrDefault<scalar>
+            (
+                "kSolidificationSourceScale",
+                legacySolidificationSourceScale
+            );
+
+        epsilonSolidificationSourceScale_ =
+            coeffs.template lookupOrDefault<scalar>
+            (
+                "epsilonSolidificationSourceScale",
+                legacySolidificationSourceScale
             );
 
         lambda2_ =

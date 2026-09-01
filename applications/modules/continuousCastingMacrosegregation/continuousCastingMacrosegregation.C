@@ -20,6 +20,7 @@ License
 #include "fvmDiv.H"
 #include "fvmLaplacian.H"
 #include "fvcLaplacian.H"
+#include "fvcSnGrad.H"
 #include "fvmSup.H"
 #include "surfaceInterpolate.H"
 #include "zeroGradientFvPatchFields.H"
@@ -54,26 +55,37 @@ void Foam::solvers::continuousCastingMacrosegregation::continuityErrors()
 Foam::scalar
 Foam::solvers::continuousCastingMacrosegregation::maxDeltaT() const
 {
+    scalar deltaT = vGreat;
+
     if (!pseudoSteadyEnabled_)
     {
-        return basicFluidSolver::maxDeltaT();
+        deltaT = basicFluidSolver::maxDeltaT();
     }
-
-    scalar deltaT =
-        min
-        (
-            fvModels().maxDeltaT(),
-            min(pseudoDeltaTTarget_, pseudoMaxDeltaT_)
-        );
-
-    if (pseudoMaxCo_ < vGreat && CoNum > small)
+    else
     {
         deltaT =
             min
             (
-                deltaT,
-                pseudoMaxCo_/CoNum*runTime.deltaTValue()
+                fvModels().maxDeltaT(),
+                min(pseudoDeltaTTarget_, pseudoMaxDeltaT_)
             );
+
+        if (pseudoMaxCo_ < vGreat && CoNum > small)
+        {
+            deltaT =
+                min
+                (
+                    deltaT,
+                    pseudoMaxCo_/CoNum*runTime.deltaTValue()
+                );
+        }
+    }
+
+    // CC10d: after a failed nonlinear T-C-fs closure, constrain the next
+    // physical time step independently of the Courant-number controller.
+    if (couplingTimeStepControl_ && couplingDeltaTLimit_ < 0.5*vGreat)
+    {
+        deltaT = min(deltaT, couplingDeltaTLimit_);
     }
 
     return deltaT;
@@ -249,6 +261,676 @@ bool Foam::solvers::continuousCastingMacrosegregation::diagnosticEnabled
         name,
         true
     );
+}
+
+
+Foam::label
+Foam::solvers::continuousCastingMacrosegregation::wallCarbonAuditCell() const
+{
+    const vector target =
+        diagnosticsProperties_.lookupOrDefault<vector>
+        (
+            "wallCarbonTarget",
+            vector(-0.0825, 0.0825, 0.5)
+        );
+
+    const vectorField& cellCentres = mesh_.C();
+
+    scalar localMinDistSqr = GREAT;
+    label localCell = -1;
+
+    forAll(cellCentres, celli)
+    {
+        const scalar distSqr = magSqr(cellCentres[celli] - target);
+
+        if (distSqr < localMinDistSqr)
+        {
+            localMinDistSqr = distSqr;
+            localCell = celli;
+        }
+    }
+
+    const scalar globalMinDistSqr =
+        returnReduce(localMinDistSqr, minOp<scalar>());
+
+    const scalar matchTolerance =
+        SMALL*max(scalar(1), mag(globalMinDistSqr));
+
+    const bool localMatch =
+        localCell >= 0
+     && mag(localMinDistSqr - globalMinDistSqr) <= matchTolerance;
+
+    // Resolve an unlikely exact tie by selecting the lowest processor rank.
+    const label candidateProc =
+        localMatch ? Pstream::myProcNo() : Pstream::nProcs();
+
+    const label ownerProc =
+        returnReduce(candidateProc, minOp<label>());
+
+    if (localMatch && Pstream::myProcNo() == ownerProc)
+    {
+        return localCell;
+    }
+
+    return -1;
+}
+
+
+void Foam::solvers::continuousCastingMacrosegregation::
+updateWallCarbonHistoryDiagnostics() const
+{
+    // Unlike diagnosticEnabled(), which defaults an unspecified diagnostic
+    // to true, this targeted audit is explicitly opt-in.
+    if
+    (
+        !diagnosticsProperties_.lookupOrDefault<Switch>
+        (
+            "wallCarbonHistory",
+            false
+        )
+     || !diagnosticEnabled("wallCarbonHistory")
+    )
+    {
+        return;
+    }
+
+    const label celli = wallCarbonAuditCell();
+
+    if (celli < 0)
+    {
+        return;
+    }
+
+    const scalar fsCell =
+        min(max(fs_[celli], scalar(0)), scalar(1));
+
+    const scalar flCell = 1.0 - fsCell;
+
+    const scalar carbonMacrosegregation =
+        100.0*(Carbon_[celli] - Carbon0_)/Carbon0_;
+
+    const vector relativeVelocity =
+        U_[celli] - solidVelocity_;
+
+    Pout<< "WALL_CARBON_HISTORY"
+        << " time=" << runTime.value()
+        << " dt=" << runTime.deltaTValue()
+        << " proc=" << Pstream::myProcNo()
+        << " cell=" << celli
+        << " Ccoord=" << mesh_.C()[celli]
+        << " T=" << T_[celli]
+        << " Carbon=" << Carbon_[celli]
+        << " CarbonL=" << CarbonL_[celli]
+        << " CarbonS=" << CarbonS_[celli]
+        << " CarbonSInterface=" << CarbonSInterface_[celli]
+        << " macroseg=" << carbonMacrosegregation
+        << " fs=" << fsCell
+        << " fl=" << flCell
+        << " U=" << U_[celli]
+        << " URel=" << relativeVelocity
+        << " magURel=" << mag(relativeVelocity)
+        << " Dmix=" << speciesDiffusivity_[celli]
+        << " liquidAdvectionFactor=" << liquidAdvectionFactor_[celli]
+        << " tf=" << localSolidificationTime_[celli]
+        << " beta=" << backDiffusionCoefficient_[celli]
+        << endl;
+}
+
+
+void Foam::solvers::continuousCastingMacrosegregation::
+updateWallCarbonFaceDiagnostics() const
+{
+    // Explicit opt-in.  This audit compares the actual linearly interpolated
+    // liquid-phase diffusion coefficient used at each face of the target
+    // cell with a hypothetical harmonic interpolation.  It does not modify
+    // the solved species equation.
+    if
+    (
+        !diagnosticsProperties_.lookupOrDefault<Switch>
+        (
+            "wallCarbonFaceAudit",
+            false
+        )
+     || !diagnosticEnabled("wallCarbonFaceAudit")
+    )
+    {
+        return;
+    }
+
+    const label celli = wallCarbonAuditCell();
+
+    const dimensionedScalar DLDim
+    (
+        "DLWallFaceAudit",
+        dimArea/dimTime,
+        DL_
+    );
+
+    const tmp<volScalarField> tNut = momentumTransport->nut();
+
+    const volScalarField effectiveLiquidDiffusivity
+    (
+        IOobject
+        (
+            "wallFaceAuditDlEffTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        DLDim + tNut()/Sct_
+    );
+
+    const volScalarField liquidFraction
+    (
+        IOobject
+        (
+            "wallFaceAuditLiquidFractionTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        scalar(1) - fs_
+    );
+
+    const volScalarField gammaLiquid
+    (
+        IOobject
+        (
+            "wallFaceAuditGammaTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        liquidFraction*effectiveLiquidDiffusivity
+    );
+
+    // Every rank must execute these coupled surface operations.  In
+    // particular, processor-patch interpolation/snGrad exchanges data.
+    const tmp<surfaceScalarField> tGammaLinear =
+        fvc::interpolate(gammaLiquid);
+
+    const tmp<surfaceScalarField> tSnGradCl =
+        fvc::snGrad(CarbonL_);
+
+    const surfaceScalarField& gammaLinear = tGammaLinear();
+    const surfaceScalarField& snGradCl = tSnGradCl();
+
+    // Only the rank owning the selected cell prints its faces.
+    if (celli < 0)
+    {
+        return;
+    }
+
+    const labelList& cellFaces = mesh_.cells()[celli];
+    const labelUList& owner = mesh_.faceOwner();
+    const labelUList& neighbour = mesh_.faceNeighbour();
+
+    const scalar cellVolume = mesh_.V()[celli];
+
+    scalar sumLinear = 0.0;
+    scalar sumHarmonic = 0.0;
+
+    Pout<< "WALL_CARBON_FACE_BEGIN"
+        << " time=" << runTime.value()
+        << " proc=" << Pstream::myProcNo()
+        << " cell=" << celli
+        << " Ccoord=" << mesh_.C()[celli]
+        << " fs=" << fs_[celli]
+        << " fl=" << 1.0 - fs_[celli]
+        << " Carbon=" << Carbon_[celli]
+        << " CarbonL=" << CarbonL_[celli]
+        << endl;
+
+    forAll(cellFaces, i)
+    {
+        const label facei = cellFaces[i];
+        const bool targetIsOwner = owner[facei] == celli;
+        const scalar orientation = targetIsOwner ? 1.0 : -1.0;
+
+        scalar gammaP = gammaLiquid[celli];
+        scalar gammaN = gammaP;
+        scalar flN = 1.0 - fs_[celli];
+        scalar clN = CarbonL_[celli];
+        scalar interpolationWeight = 1.0;
+        scalar gammaLinearFace = 0.0;
+        scalar snGradClFace = 0.0;
+        scalar area = 0.0;
+        scalar gammaHarmonic = 0.0;
+        word faceKind("physicalBoundary");
+        word patchName("none");
+
+        if (facei < mesh_.nInternalFaces())
+        {
+            faceKind = "internal";
+            gammaLinearFace = gammaLinear[facei];
+            snGradClFace = snGradCl[facei];
+            area = mesh_.magSf()[facei];
+            gammaHarmonic = gammaLinearFace;
+
+            const label otherCell =
+                targetIsOwner ? neighbour[facei] : owner[facei];
+
+            gammaN = gammaLiquid[otherCell];
+            flN = 1.0 - fs_[otherCell];
+            clN = CarbonL_[otherCell];
+
+            const scalar denom = gammaP - gammaN;
+
+            if (mag(denom) > VSMALL)
+            {
+                interpolationWeight =
+                    (gammaLinearFace - gammaN)/denom;
+                interpolationWeight =
+                    min(max(interpolationWeight, scalar(0)), scalar(1));
+            }
+            else
+            {
+                interpolationWeight = 0.5;
+            }
+
+            if (gammaP <= VSMALL || gammaN <= VSMALL)
+            {
+                gammaHarmonic = 0.0;
+            }
+            else
+            {
+                gammaHarmonic =
+                    1.0
+                   /(
+                        interpolationWeight/gammaP
+                      + (1.0 - interpolationWeight)/gammaN
+                    );
+            }
+        }
+        else
+        {
+            // OpenFOAM Foundation v14: fvMesh exposes fvBoundaryMesh via
+            // boundary(), but not polyMesh::boundaryMesh() directly here.
+            // Locate the boundary patch containing this global face index.
+            label patchi = -1;
+
+            forAll(mesh_.boundary(), patchj)
+            {
+                const fvPatch& patch = mesh_.boundary()[patchj];
+
+                if
+                (
+                    facei >= patch.start()
+                 && facei < patch.start() + patch.size()
+                )
+                {
+                    patchi = patchj;
+                    break;
+                }
+            }
+
+            if (patchi < 0)
+            {
+                FatalErrorInFunction
+                    << "Unable to identify boundary patch for face "
+                    << facei << exit(FatalError);
+            }
+
+            const label patchFacei =
+                facei - mesh_.boundary()[patchi].start();
+
+            patchName = mesh_.boundary()[patchi].name();
+            gammaLinearFace = gammaLinear.boundaryField()[patchi][patchFacei];
+            snGradClFace = snGradCl.boundaryField()[patchi][patchFacei];
+            area = mesh_.boundary()[patchi].magSf()[patchFacei];
+            gammaHarmonic = gammaLinearFace;
+
+            if (mesh_.boundary()[patchi].coupled())
+            {
+                faceKind = "processorCoupled";
+
+                const tmp<scalarField> tGammaNeighbour =
+                    gammaLiquid.boundaryField()[patchi].patchNeighbourField();
+
+                const tmp<scalarField> tClNeighbour =
+                    CarbonL_.boundaryField()[patchi].patchNeighbourField();
+
+                const tmp<scalarField> tFsNeighbour =
+                    fs_.boundaryField()[patchi].patchNeighbourField();
+
+                gammaN = tGammaNeighbour()[patchFacei];
+                clN = tClNeighbour()[patchFacei];
+                flN = 1.0 - tFsNeighbour()[patchFacei];
+
+                const scalar denom = gammaP - gammaN;
+
+                if (mag(denom) > VSMALL)
+                {
+                    interpolationWeight =
+                        (gammaLinearFace - gammaN)/denom;
+                    interpolationWeight =
+                        min
+                        (
+                            max(interpolationWeight, scalar(0)),
+                            scalar(1)
+                        );
+                }
+                else
+                {
+                    interpolationWeight = 0.5;
+                }
+
+                if (gammaP <= VSMALL || gammaN <= VSMALL)
+                {
+                    gammaHarmonic = 0.0;
+                }
+                else
+                {
+                    gammaHarmonic =
+                        1.0
+                       /(
+                            interpolationWeight/gammaP
+                          + (1.0 - interpolationWeight)/gammaN
+                        );
+                }
+            }
+            else
+            {
+                // On a physical boundary there is no neighbouring cell for
+                // a harmonic two-cell comparison.  Keep the actual face
+                // coefficient for both values; snGrad(Cl) still reveals any
+                // boundary-normal liquid diffusion.
+                gammaN =
+                    gammaLiquid.boundaryField()[patchi][patchFacei];
+                flN =
+                    1.0 - fs_.boundaryField()[patchi][patchFacei];
+                clN =
+                    CarbonL_.boundaryField()[patchi][patchFacei];
+                gammaHarmonic = gammaLinearFace;
+                interpolationWeight = 1.0;
+            }
+        }
+
+        // This is the face contribution appearing in +div(Gamma grad Cl),
+        // oriented outward from the selected target cell.  It is not the
+        // Fick flux sign convention (-Gamma grad Cl).
+        const scalar operatorFluxLinear =
+            orientation*gammaLinearFace*snGradClFace*area;
+
+        const scalar operatorFluxHarmonic =
+            orientation*gammaHarmonic*snGradClFace*area;
+
+        sumLinear += operatorFluxLinear;
+        sumHarmonic += operatorFluxHarmonic;
+
+        Pout<< "WALL_CARBON_FACE"
+            << " time=" << runTime.value()
+            << " proc=" << Pstream::myProcNo()
+            << " cell=" << celli
+            << " face=" << facei
+            << " kind=" << faceKind
+            << " patch=" << patchName
+            << " area=" << area
+            << " flP=" << 1.0 - fs_[celli]
+            << " flN=" << flN
+            << " ClP=" << CarbonL_[celli]
+            << " ClN=" << clN
+            << " gammaP=" << gammaP
+            << " gammaN=" << gammaN
+            << " weightP=" << interpolationWeight
+            << " gammaLinear=" << gammaLinearFace
+            << " gammaHarmonic=" << gammaHarmonic
+            << " snGradCl=" << snGradClFace
+            << " opFluxLinear=" << operatorFluxLinear
+            << " opFluxHarmonic=" << operatorFluxHarmonic
+            << endl;
+    }
+
+    Pout<< "WALL_CARBON_FACE_SUM"
+        << " time=" << runTime.value()
+        << " proc=" << Pstream::myProcNo()
+        << " cell=" << celli
+        << " fs=" << fs_[celli]
+        << " fl=" << 1.0 - fs_[celli]
+        << " linearTendency=" << sumLinear/cellVolume
+        << " harmonicTendency=" << sumHarmonic/cellVolume
+        << " ratio="
+        <<
+        (
+            mag(sumLinear) > VSMALL
+          ? sumHarmonic/sumLinear
+          : scalar(0)
+        )
+        << endl;
+}
+
+
+void Foam::solvers::continuousCastingMacrosegregation::
+updateWallCarbonFluxDiagnostics() const
+{
+    // Explicit opt-in for this more expensive operator reconstruction.
+    if
+    (
+        !diagnosticsProperties_.lookupOrDefault<Switch>
+        (
+            "wallCarbonFluxAudit",
+            false
+        )
+     || !diagnosticEnabled("wallCarbonFluxAudit")
+    )
+    {
+        return;
+    }
+
+    const label celli = wallCarbonAuditCell();
+
+    // IMPORTANT: do not return on non-owning ranks here.  The fvc::div and
+    // fvc::laplacian operations below exchange processor-boundary data, so
+    // every MPI rank must execute them in the same order.  Only the final
+    // cell extraction/printing is restricted to the owning rank.
+
+    const scalar dt = runTime.deltaTValue();
+
+    if (dt <= SMALL)
+    {
+        return;
+    }
+
+    const dimensionedScalar DLDim
+    (
+        "DLWallAudit",
+        dimArea/dimTime,
+        DL_
+    );
+
+    const dimensionedScalar DSDim
+    (
+        "DSWallAudit",
+        dimArea/dimTime,
+        DS_
+    );
+
+    const tmp<volScalarField> tNut =
+        momentumTransport->nut();
+
+    const volScalarField effectiveLiquidDiffusivity
+    (
+        IOobject
+        (
+            "wallAuditDlEffTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        DLDim + tNut()/Sct_
+    );
+
+    const volScalarField liquidFraction
+    (
+        IOobject
+        (
+            "wallAuditLiquidFractionTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        scalar(1) - fs_
+    );
+
+    const dimensionedVector solidVelocityDim
+    (
+        "solidVelocityWallAudit",
+        dimLength/dimTime,
+        solidVelocity_
+    );
+
+    const surfaceScalarField solidPhi
+    (
+        IOobject
+        (
+            "wallAuditSolidPhiTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        solidVelocityDim & mesh_.Sf()
+    );
+
+    const surfaceScalarField relativePhi
+    (
+        IOobject
+        (
+            "wallAuditRelativePhiTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        phi_ - solidPhi
+    );
+
+    // Same Dong-form relative-composition field used by solveSpeciesTransport.
+    const volScalarField relativeLiquidComposition
+    (
+        IOobject
+        (
+            "wallAuditRelativeCompositionTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        fs_*(CarbonL_ - CarbonS_)
+    );
+
+    // Reconstruct the final-state physical species equation directly:
+    //
+    //   dC/dt + div(U C)
+    //     = div(fl DlEff grad(Cl))
+    //     + div(fs Ds grad(Cs))
+    //     - div((U-us) fs(Cl-Cs)).
+    //
+    // These are physical final-state terms, not the internal Picard
+    // decomposition used by phaseLinearized or mixtureCorrection.
+    const scalar rDeltaT = 1.0/dt;
+
+    const volScalarField storage
+    (
+        IOobject
+        (
+            "wallAuditStorageTmp",
+            runTime.name(),
+            mesh_,
+            IOobject::NO_READ,
+            IOobject::NO_WRITE,
+            false
+        ),
+        rDeltaT*(Carbon_ - Carbon_.oldTime())
+    );
+
+    const tmp<volScalarField> tBulkAdvection =
+        fvc::div(phi_, Carbon_, "div(phi,Carbon)");
+
+    const tmp<volScalarField> tLiquidDiffusion =
+        fvc::laplacian
+        (
+            liquidFraction*effectiveLiquidDiffusivity,
+            CarbonL_
+        );
+
+    const tmp<volScalarField> tSolidDiffusion =
+        fvc::laplacian
+        (
+            fs_*DSDim,
+            CarbonS_
+        );
+
+    const tmp<volScalarField> tRelativeAdvection =
+        fvc::div
+        (
+            relativePhi,
+            relativeLiquidComposition,
+            "div(phi,Carbon)"
+        );
+
+    const volScalarField& bulkAdvection = tBulkAdvection();
+    const volScalarField& liquidDiffusion = tLiquidDiffusion();
+    const volScalarField& solidDiffusion = tSolidDiffusion();
+    const volScalarField& relativeAdvection = tRelativeAdvection();
+
+    // The parallel operators above must be evaluated on every rank.
+    // Only the rank owning the globally selected audit cell reads/prints it.
+    if (celli >= 0)
+    {
+        // Print each transport contribution with the sign it contributes
+        // to dC/dt.
+        const scalar bulkTendency = -bulkAdvection[celli];
+        const scalar liquidDiffusionTendency = liquidDiffusion[celli];
+        const scalar solidDiffusionTendency = solidDiffusion[celli];
+        const scalar relativeAdvectionTendency = -relativeAdvection[celli];
+
+        const scalar predictedTendency =
+            bulkTendency
+          + liquidDiffusionTendency
+          + solidDiffusionTendency
+          + relativeAdvectionTendency;
+
+        const scalar storageTendency = storage[celli];
+        const scalar residual = storageTendency - predictedTendency;
+
+        const scalar fsCell =
+            min(max(fs_[celli], scalar(0)), scalar(1));
+
+        Pout<< "WALL_CARBON_FLUX"
+            << " time=" << runTime.value()
+            << " dt=" << dt
+            << " proc=" << Pstream::myProcNo()
+            << " cell=" << celli
+            << " Ccoord=" << mesh_.C()[celli]
+            << " Carbon=" << Carbon_[celli]
+            << " CarbonOld=" << Carbon_.oldTime()[celli]
+            << " dCarbon=" << Carbon_[celli] - Carbon_.oldTime()[celli]
+            << " fs=" << fsCell
+            << " fl=" << 1.0 - fsCell
+            << " magURel=" << mag(U_[celli] - solidVelocity_)
+            << " storage=" << storageTendency
+            << " bulkAdv=" << bulkTendency
+            << " liquidDiff=" << liquidDiffusionTendency
+            << " solidDiff=" << solidDiffusionTendency
+            << " relativeAdv=" << relativeAdvectionTendency
+            << " predicted=" << predictedTendency
+            << " residual=" << residual
+            << endl;
+    }
 }
 
 
@@ -445,15 +1127,49 @@ void Foam::solvers::continuousCastingMacrosegregation::validateAlloyProperties()
      || temperatureNonlinearRelaxation_ > 1.0
      || speciesNonlinearRelaxation_ <= SMALL
      || speciesNonlinearRelaxation_ > 1.0
+     || solidFractionNonlinearRelaxation_ <= SMALL
+     || solidFractionNonlinearRelaxation_ > 1.0
+     || minimumNonlinearRelaxation_ <= SMALL
+     || minimumNonlinearRelaxation_ > 1.0
+     || minimumNonlinearRelaxation_ > temperatureNonlinearRelaxation_
+     || minimumNonlinearRelaxation_ > speciesNonlinearRelaxation_
+     || minimumNonlinearRelaxation_ > solidFractionNonlinearRelaxation_
+     || nonlinearRelaxationReductionFactor_ <= SMALL
+     || nonlinearRelaxationReductionFactor_ >= 1.0
+     || nonlinearResidualStallRatio_ <= SMALL
+     || nonlinearResidualStallRatio_ > 1.0
+     || nonlinearResidualBadIterations_ < 1
+     || couplingFailureDeltaTFactor_ <= SMALL
+     || couplingFailureDeltaTFactor_ >= 1.0
+     || couplingRecoveryFactor_ <= 1.0
+     || couplingRecoverySuccessfulSteps_ < 1
     )
     {
         FatalIOErrorInFunction(alloyProperties_)
-            << "CC10c nonlinear relaxation factors must satisfy "
-            << "0 < omega <= 1." << nl
+            << "Nonlinear relaxation controls are invalid." << nl
+            << "Require initial/minimum relaxations in (0,1], reduction "
+            << "factor in (0,1), stall ratio in (0,1], and bad-iteration "
+            << "count >= 1." << nl
             << "    temperatureNonlinearRelaxation = "
             << temperatureNonlinearRelaxation_ << nl
             << "    speciesNonlinearRelaxation = "
-            << speciesNonlinearRelaxation_
+            << speciesNonlinearRelaxation_ << nl
+            << "    solidFractionNonlinearRelaxation = "
+            << solidFractionNonlinearRelaxation_ << nl
+            << "    minimumNonlinearRelaxation = "
+            << minimumNonlinearRelaxation_ << nl
+            << "    nonlinearRelaxationReductionFactor = "
+            << nonlinearRelaxationReductionFactor_ << nl
+            << "    nonlinearResidualStallRatio = "
+            << nonlinearResidualStallRatio_ << nl
+            << "    nonlinearResidualBadIterations = "
+            << nonlinearResidualBadIterations_ << nl
+            << "    couplingFailureDeltaTFactor = "
+            << couplingFailureDeltaTFactor_ << nl
+            << "    couplingRecoveryFactor = "
+            << couplingRecoveryFactor_ << nl
+            << "    couplingRecoverySuccessfulSteps = "
+            << couplingRecoverySuccessfulSteps_
             << exit(FatalIOError);
     }
 }
@@ -496,9 +1212,18 @@ updateLocalSolidificationTime()
 Foam::scalar
 Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
 (
-    const bool report
+    const bool report,
+    const scalar phaseRelaxation
 )
 {
+    if (phaseRelaxation <= SMALL || phaseRelaxation > 1.0)
+    {
+        FatalErrorInFunction
+            << "phaseRelaxation must satisfy 0 < omega <= 1. Current value: "
+            << phaseRelaxation
+            << abort(FatalError);
+    }
+
     scalar minT = GREAT;
     scalar maxT = -GREAT;
 
@@ -573,6 +1298,8 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
         const scalar Tsol =
             Tmelt_ + liquidusSlope_*Ccell/kp_;
 
+        const scalar fsOldIter = fs_[celli];
+
         scalar fsCell = 0.0;
         scalar dfsdTCell = 0.0;
 
@@ -618,6 +1345,22 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
             dfsdTCell =
                 liquidusSlope_*Ccell
                /((1.0 - kp_)*sqr(dTToMelt));
+        }
+
+        // Under-relax the algebraic phase-state update during the inner
+        // macro<->micro fixed-point iteration.  The converged fixed point is
+        // unchanged; omega_fs=1 recovers the original closure exactly.
+        if (phaseRelaxation < 1.0)
+        {
+            fsCell =
+                fsOldIter
+              + phaseRelaxation*(fsCell - fsOldIter);
+
+            fsCell = min(max(fsCell, scalar(0)), scalar(1));
+
+            // During a relaxed Picard update the local Jacobian of the
+            // relaxed phase map is scaled by the same factor.
+            dfsdTCell *= phaseRelaxation;
         }
 
         // Paper Eqs. (14) and (15). Since rho_s = rho_l for this
@@ -794,8 +1537,6 @@ Foam::solvers::continuousCastingMacrosegregation::updatePhaseState
                     << abort(FatalError);
             }
         }
-
-        const scalar fsOldIter = fs_[celli];
 
         fs_[celli] = fsCell;
         CarbonL_[celli] = CarbonLCell;
@@ -1481,7 +2222,8 @@ void Foam::solvers::continuousCastingMacrosegregation::updateSpeciesDiagnostics
 Foam::scalar
 Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
 (
-    const bool report
+    const bool report,
+    const scalar nonlinearRelaxation
 )
 {
     // Bennon-Incropera mixture species equation used by the paper, Eq. (19):
@@ -1809,7 +2551,12 @@ Foam::solvers::continuousCastingMacrosegregation::solveSpeciesTransport
     //
     // This acts on the current Carbon Picard equation, not on any physical
     // diffusion/advection coefficient. omega_C=1 reproduces CC10b exactly.
-    CarbonEqn.relax(speciesNonlinearRelaxation_);
+    const scalar omegaC =
+        nonlinearRelaxation > SMALL
+      ? nonlinearRelaxation
+      : speciesNonlinearRelaxation_;
+
+    CarbonEqn.relax(omegaC);
     CarbonEqn.solve();
 
     // -----------------------------------------------------------------
@@ -3219,6 +3966,88 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
             1.0
         )
     ),
+    solidFractionNonlinearRelaxation_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "solidFractionNonlinearRelaxation",
+            1.0
+        )
+    ),
+    adaptiveNonlinearRelaxation_
+    (
+        alloyProperties_.lookupOrDefault<bool>
+        (
+            "adaptiveNonlinearRelaxation",
+            false
+        )
+    ),
+    minimumNonlinearRelaxation_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "minimumNonlinearRelaxation",
+            0.125
+        )
+    ),
+    nonlinearRelaxationReductionFactor_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "nonlinearRelaxationReductionFactor",
+            0.5
+        )
+    ),
+    nonlinearResidualStallRatio_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "nonlinearResidualStallRatio",
+            0.95
+        )
+    ),
+    nonlinearResidualBadIterations_
+    (
+        alloyProperties_.lookupOrDefault<label>
+        (
+            "nonlinearResidualBadIterations",
+            2
+        )
+    ),
+    couplingTimeStepControl_
+    (
+        alloyProperties_.lookupOrDefault<bool>
+        (
+            "couplingTimeStepControl",
+            true
+        )
+    ),
+    couplingFailureDeltaTFactor_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "couplingFailureDeltaTFactor",
+            0.5
+        )
+    ),
+    couplingRecoveryFactor_
+    (
+        alloyProperties_.lookupOrDefault<scalar>
+        (
+            "couplingRecoveryFactor",
+            1.2
+        )
+    ),
+    couplingRecoverySuccessfulSteps_
+    (
+        alloyProperties_.lookupOrDefault<label>
+        (
+            "couplingRecoverySuccessfulSteps",
+            5
+        )
+    ),
+    couplingDeltaTLimit_(vGreat),
+    couplingSuccessfulStepsSinceFailure_(0),
 
     g_
     (
@@ -3698,9 +4527,26 @@ Foam::solvers::continuousCastingMacrosegregation::continuousCastingMacrosegregat
         << temperatureCouplingTolerance_ << " "
         << carbonCouplingTolerance_ << " "
         << solidFractionCouplingTolerance_ << nl
-        << "    nonlinear relaxation (T,C)    = "
+        << "    nonlinear relaxation (T,C,fs) = "
         << temperatureNonlinearRelaxation_ << " "
-        << speciesNonlinearRelaxation_
+        << speciesNonlinearRelaxation_ << " "
+        << solidFractionNonlinearRelaxation_ << nl
+        << "    adaptive nonlinear relaxation = "
+        << adaptiveNonlinearRelaxation_ << nl
+        << "    adaptive min/reduction/stall   = "
+        << minimumNonlinearRelaxation_ << " "
+        << nonlinearRelaxationReductionFactor_ << " "
+        << nonlinearResidualStallRatio_ << nl
+        << "    adaptive bad-iteration count  = "
+        << nonlinearResidualBadIterations_ << nl
+        << "    coupling time-step control    = "
+        << couplingTimeStepControl_ << nl
+        << "    coupling dt failure factor    = "
+        << couplingFailureDeltaTFactor_ << nl
+        << "    coupling dt recovery factor   = "
+        << couplingRecoveryFactor_ << nl
+        << "    coupling recovery successes   = "
+        << couplingRecoverySuccessfulSteps_
         << endl;
 
     mesh.schemes().setFluxRequired(p.name());
@@ -3997,6 +4843,12 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
       ? maxSolidificationIterations_
       : nSolidificationLoops_;
 
+    scalar omegaTCurrent = temperatureNonlinearRelaxation_;
+    scalar omegaCCurrent = speciesNonlinearRelaxation_;
+    scalar omegaFsCurrent = solidFractionNonlinearRelaxation_;
+    scalar previousNormalizedResidual = GREAT;
+    label consecutiveBadResiduals = 0;
+
     if (energyDiagnosticsNow)
     {
         Info<< "Solidification/variable-property energy coupling" << nl
@@ -4027,6 +4879,8 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         // CC10a: snapshot the coupled iterate before this fixed-point
         // correction. This is diagnostic-only and does not modify the
         // physical fields.
+        const scalarField TBeforeIter(T_.primitiveField());
+        const scalarField CarbonBeforeIter(Carbon_.primitiveField());
         const scalarField fsBeforeIter(fs_.primitiveField());
 
         // Hybrid latent-storage linearisation.
@@ -4183,8 +5037,6 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 );
         }
 
-        const scalarField TBefore(T_.primitiveField());
-
         fvScalarMatrix TEqn
         (
             fvm::ddt(CpMix_, T_)
@@ -4203,7 +5055,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         //
         // This damps the segregated fixed-point update without changing the
         // converged equation. omega_T=1 reproduces the CC10b matrix exactly.
-        TEqn.relax(temperatureNonlinearRelaxation_);
+        TEqn.relax(omegaTCurrent);
         TEqn.solve();
 
         // -----------------------------------------------------------------
@@ -4506,11 +5358,22 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         }
 
         scalar maxDeltaTIter = 0.0;
+        scalar localMaxDeltaTIter = -GREAT;
+        label localMaxDeltaTCell = -1;
 
         forAll(T_, celli)
         {
+            const scalar dTCell =
+                mag(T_[celli] - TBeforeIter[celli]);
+
             maxDeltaTIter =
-                max(maxDeltaTIter, mag(T_[celli] - TBefore[celli]));
+                max(maxDeltaTIter, dTCell);
+
+            if (dTCell > localMaxDeltaTIter)
+            {
+                localMaxDeltaTIter = dTCell;
+                localMaxDeltaTCell = celli;
+            }
         }
 
         maxDeltaTIter =
@@ -4520,7 +5383,7 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
         // species equation uses phase fractions/compositions consistent
         // with this thermal correction.
         const scalar maxDeltaFsThermal =
-            updatePhaseState(false);
+            updatePhaseState(false, omegaFsCurrent);
 
         // Solve mixture solute conservation. This changes Carbon and hence
         // the local liquidus/solidus and phase compositions. On the final
@@ -4530,29 +5393,229 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
             corr == iterationLimit - 1;
 
         const scalar maxDeltaCarbon =
-            solveSpeciesTransport(finalLoop);
+            solveSpeciesTransport(finalLoop, omegaCCurrent);
+
+        scalar localMaxDeltaCarbon = -GREAT;
+        label localMaxDeltaCarbonCell = -1;
+
+        forAll(Carbon_, celli)
+        {
+            const scalar dCarbonCell =
+                mag(Carbon_[celli] - CarbonBeforeIter[celli]);
+
+            if (dCarbonCell > localMaxDeltaCarbon)
+            {
+                localMaxDeltaCarbon = dCarbonCell;
+                localMaxDeltaCarbonCell = celli;
+            }
+        }
 
         // Re-close the phase equilibrium after the Carbon correction.
         const scalar maxDeltaFsSpecies =
-            updatePhaseState(finalLoop);
+            updatePhaseState(finalLoop, omegaFsCurrent);
 
         const scalar maxDeltaFs =
             max(maxDeltaFsThermal, maxDeltaFsSpecies);
 
         scalar maxDeltaFsIter = 0.0;
+        scalar localMaxDeltaFsIter = -GREAT;
+        label localMaxDeltaFsCell = -1;
 
         forAll(fs_, celli)
         {
+            const scalar dFsCell =
+                mag(fs_[celli] - fsBeforeIter[celli]);
+
             maxDeltaFsIter =
-                max
-                (
-                    maxDeltaFsIter,
-                    mag(fs_[celli] - fsBeforeIter[celli])
-                );
+                max(maxDeltaFsIter, dFsCell);
+
+            if (dFsCell > localMaxDeltaFsIter)
+            {
+                localMaxDeltaFsIter = dFsCell;
+                localMaxDeltaFsCell = celli;
+            }
         }
 
         maxDeltaFsIter =
             returnReduce(maxDeltaFsIter, maxOp<scalar>());
+
+        if (couplingDiagnosticsNow)
+        {
+            const scalar globalMaxDeltaCarbon =
+                returnReduce(localMaxDeltaCarbon, maxOp<scalar>());
+
+            const scalar maxMatchTolT =
+                SMALL*max(scalar(1), mag(maxDeltaTIter));
+
+            const scalar maxMatchTolC =
+                SMALL*max(scalar(1), mag(globalMaxDeltaCarbon));
+
+            const scalar maxMatchTolFs =
+                SMALL*max(scalar(1), mag(maxDeltaFsIter));
+
+            if
+            (
+                localMaxDeltaTCell >= 0
+             && mag(localMaxDeltaTIter - maxDeltaTIter) <= maxMatchTolT
+            )
+            {
+                const label celli = localMaxDeltaTCell;
+
+                Pout<< "COUPLING_MAX_T" << nl
+                    << "    time=" << runTime.value() << nl
+                    << "    iter=" << corr + 1 << nl
+                    << "    proc=" << Pstream::myProcNo() << nl
+                    << "    cell=" << celli << nl
+                    << "    C=" << mesh_.C()[celli] << nl
+                    << "    TBefore=" << TBeforeIter[celli] << nl
+                    << "    TAfter=" << T_[celli] << nl
+                    << "    CarbonBefore=" << CarbonBeforeIter[celli] << nl
+                    << "    CarbonAfter=" << Carbon_[celli] << nl
+                    << "    CarbonL=" << CarbonL_[celli] << nl
+                    << "    fsBefore=" << fsBeforeIter[celli] << nl
+                    << "    fsAfter=" << fs_[celli] << nl
+                    << "    dT=" << localMaxDeltaTIter
+                    << endl;
+            }
+
+            if
+            (
+                localMaxDeltaCarbonCell >= 0
+             && mag(localMaxDeltaCarbon - globalMaxDeltaCarbon)
+                <= maxMatchTolC
+            )
+            {
+                const label celli = localMaxDeltaCarbonCell;
+
+                Pout<< "COUPLING_MAX_CARBON" << nl
+                    << "    time=" << runTime.value() << nl
+                    << "    iter=" << corr + 1 << nl
+                    << "    proc=" << Pstream::myProcNo() << nl
+                    << "    cell=" << celli << nl
+                    << "    C=" << mesh_.C()[celli] << nl
+                    << "    TBefore=" << TBeforeIter[celli] << nl
+                    << "    TAfter=" << T_[celli] << nl
+                    << "    CarbonBefore=" << CarbonBeforeIter[celli] << nl
+                    << "    CarbonAfter=" << Carbon_[celli] << nl
+                    << "    CarbonL=" << CarbonL_[celli] << nl
+                    << "    fsBefore=" << fsBeforeIter[celli] << nl
+                    << "    fsAfter=" << fs_[celli] << nl
+                    << "    dCarbon=" << localMaxDeltaCarbon
+                    << endl;
+            }
+
+            if
+            (
+                localMaxDeltaFsCell >= 0
+             && mag(localMaxDeltaFsIter - maxDeltaFsIter) <= maxMatchTolFs
+            )
+            {
+                const label celli = localMaxDeltaFsCell;
+
+                Pout<< "COUPLING_MAX_FS" << nl
+                    << "    time=" << runTime.value() << nl
+                    << "    iter=" << corr + 1 << nl
+                    << "    proc=" << Pstream::myProcNo() << nl
+                    << "    cell=" << celli << nl
+                    << "    C=" << mesh_.C()[celli] << nl
+                    << "    fsBefore=" << fsBeforeIter[celli] << nl
+                    << "    fsAfter=" << fs_[celli] << nl
+                    << "    T=" << T_[celli] << nl
+                    << "    Carbon=" << Carbon_[celli] << nl
+                    << "    CarbonL=" << CarbonL_[celli] << nl
+                    << "    dfs=" << localMaxDeltaFsIter
+                    << endl;
+            }
+        }
+
+        // Adaptive nonlinear controller.  Normalize each coupled-field
+        // change by its requested convergence tolerance and track the worst
+        // component.  If the normalized residual fails to improve by at
+        // least (1-stallRatio) for several consecutive iterations, reduce
+        // all three Picard relaxation factors for the NEXT correction.
+        const scalar normalizedResidual =
+            max
+            (
+                max
+                (
+                    maxDeltaTIter/temperatureCouplingTolerance_,
+                    maxDeltaCarbon/carbonCouplingTolerance_
+                ),
+                maxDeltaFsIter/solidFractionCouplingTolerance_
+            );
+
+        if
+        (
+            adaptiveNonlinearRelaxation_
+         && convergenceControlled
+         && corr > 0
+        )
+        {
+            if
+            (
+                normalizedResidual
+             >= nonlinearResidualStallRatio_*previousNormalizedResidual
+            )
+            {
+                ++consecutiveBadResiduals;
+            }
+            else
+            {
+                consecutiveBadResiduals = 0;
+            }
+
+            if
+            (
+                consecutiveBadResiduals
+             >= nonlinearResidualBadIterations_
+            )
+            {
+                const scalar oldOmegaT = omegaTCurrent;
+                const scalar oldOmegaC = omegaCCurrent;
+                const scalar oldOmegaFs = omegaFsCurrent;
+
+                omegaTCurrent =
+                    max
+                    (
+                        minimumNonlinearRelaxation_,
+                        nonlinearRelaxationReductionFactor_*omegaTCurrent
+                    );
+                omegaCCurrent =
+                    max
+                    (
+                        minimumNonlinearRelaxation_,
+                        nonlinearRelaxationReductionFactor_*omegaCCurrent
+                    );
+                omegaFsCurrent =
+                    max
+                    (
+                        minimumNonlinearRelaxation_,
+                        nonlinearRelaxationReductionFactor_*omegaFsCurrent
+                    );
+
+                if
+                (
+                    omegaTCurrent < oldOmegaT - SMALL
+                 || omegaCCurrent < oldOmegaC - SMALL
+                 || omegaFsCurrent < oldOmegaFs - SMALL
+                )
+                {
+                    Info<< "COUPLING_ADAPT"
+                        << " time=" << runTime.value()
+                        << " iter=" << corr + 1
+                        << " R=" << normalizedResidual
+                        << " Rprev=" << previousNormalizedResidual
+                        << " omegaT=" << oldOmegaT << "->" << omegaTCurrent
+                        << " omegaC=" << oldOmegaC << "->" << omegaCCurrent
+                        << " omegaFs=" << oldOmegaFs << "->" << omegaFsCurrent
+                        << endl;
+                }
+
+                consecutiveBadResiduals = 0;
+            }
+        }
+
+        previousNormalizedResidual = normalizedResidual;
 
         const bool couplingConverged =
             convergenceControlled
@@ -4568,8 +5631,9 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 << " iter=" << corr + 1
                 << " limit=" << iterationLimit
                 << " mode=" << solidificationIterationMode_
-                << " omegaT=" << temperatureNonlinearRelaxation_
-                << " omegaC=" << speciesNonlinearRelaxation_
+                << " omegaT=" << omegaTCurrent
+                << " omegaC=" << omegaCCurrent
+                << " omegaFs=" << omegaFsCurrent
                 << " dT=" << maxDeltaTIter
                 << " dCarbon=" << maxDeltaCarbon
                 << " dfs=" << maxDeltaFsIter
@@ -4614,6 +5678,33 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 << " dfs=" << maxDeltaFsIter
                 << endl;
 
+            if
+            (
+                couplingTimeStepControl_
+             && couplingDeltaTLimit_ < 0.5*vGreat
+            )
+            {
+                ++couplingSuccessfulStepsSinceFailure_;
+
+                if
+                (
+                    couplingSuccessfulStepsSinceFailure_
+                 >= couplingRecoverySuccessfulSteps_
+                )
+                {
+                    const scalar oldLimit = couplingDeltaTLimit_;
+                    couplingDeltaTLimit_ *= couplingRecoveryFactor_;
+                    couplingSuccessfulStepsSinceFailure_ = 0;
+
+                    Info<< "COUPLING_DT_CONTROL"
+                        << " time=" << runTime.value()
+                        << " action=recover"
+                        << " dtLimit=" << oldLimit
+                        << "->" << couplingDeltaTLimit_
+                        << endl;
+                }
+            }
+
             break;
         }
 
@@ -4627,6 +5718,37 @@ void Foam::solvers::continuousCastingMacrosegregation::thermophysicalPredictor()
                 << "    max |delta Carbon| = " << maxDeltaCarbon << nl
                 << "    max |delta fs|     = " << maxDeltaFsIter
                 << endl;
+
+            if (couplingTimeStepControl_)
+            {
+                const scalar oldLimit = couplingDeltaTLimit_;
+                const scalar failedStepLimit =
+                    couplingFailureDeltaTFactor_*runTime.deltaTValue();
+
+                couplingDeltaTLimit_ =
+                    min(couplingDeltaTLimit_, failedStepLimit);
+
+                couplingSuccessfulStepsSinceFailure_ = 0;
+
+                Info<< "COUPLING_DT_CONTROL"
+                    << " time=" << runTime.value()
+                    << " action=reduce-next-step"
+                    << " currentDt=" << runTime.deltaTValue()
+                    << " dtLimit=";
+
+                if (oldLimit < 0.5*vGreat)
+                {
+                    Info<< oldLimit;
+                }
+                else
+                {
+                    Info<< "unlimited";
+                }
+
+                Info<< "->" << couplingDeltaTLimit_
+                    << " factor=" << couplingFailureDeltaTFactor_
+                    << endl;
+            }
         }
     }
 }
@@ -4776,6 +5898,12 @@ void Foam::solvers::continuousCastingMacrosegregation::postSolve()
     // the physical time step. The detailed audit is already printed at the
     // final solidification correction.
     updateSpeciesDiagnostics(false);
+
+    // Targeted wall-adjacent Carbon diagnostics. These reconstruct the
+    // accepted physical-time-step state only and never modify the solution.
+    updateWallCarbonHistoryDiagnostics();
+    updateWallCarbonFluxDiagnostics();
+    updateWallCarbonFaceDiagnostics();
 
     // Retain the v10 field-based global balance for comparison with the
     // new v11 discrete-operator audit printed during the final T correction.
