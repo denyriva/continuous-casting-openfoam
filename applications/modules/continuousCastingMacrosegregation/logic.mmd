@@ -1,50 +1,86 @@
 flowchart TD
 
-    A["Start physical time step n → n+1<br/>Known fields from previous converged step:<br/>Uⁿ, pⁿ, Tⁿ, Cⁿ, fsⁿ, Clⁿ, Csⁿ"]
+    A["Begin physical OpenFOAM step n -> n+1<br/>Known accepted state at tn:<br/>U, p, phi, T, Carbon, fs, phase fields, turbulence"]
 
-    %% =========================
-    %% MOMENTUM
-    %% =========================
+    A --> B["preSolve()<br/>Advance Voller-Beckermann localSolidificationTime<br/>from previous accepted phase state<br/>Update Courant/LTS information<br/>Update mesh if required"]
 
-    A --> B["Update thermo-solutal buoyancy<br/><br/>aT = -g βT (T - Tref)<br/>aC = -g βC (Cl - C0)<br/><br/><b>EXPLICIT</b><br/>uses currently available T and Cl"]
+    B --> C["Momentum-transport predictor<br/>momentumTransport->predict()"]
 
-    B --> C["Update BKC resistance<br/><br/>K⁻¹ = K0⁻¹ fsB²/(1-fsB)³<br/>Sdrag = νl K⁻¹<br/><br/><b>EXPLICIT coefficient</b><br/>computed from current fs"]
+    C --> D["Update buoyancy<br/>thermal + solutal Boussinesq acceleration"]
 
-    C --> D["Solve momentum equation for U<br/><br/>ddt(U) + div(phi,U) + viscous<br/>+ Sp(Sdrag,U)<br/>= -grad(p) + buoyancy<br/><br/><b>IMPLICIT:</b> U, BKC drag<br/><b>EXPLICIT:</b> buoyancy"]
+    D --> E["Update moving-solid BKC drag<br/>D = nu_l / K(fs)<br/>drag acts on U - Us"]
 
-    %% =========================
-    %% NONLINEAR T-C-fs LOOP
-    %% =========================
+    E --> F["Solve momentum predictor<br/>ddt(U) + div(phi,U) + viscous + Sp(D,U)<br/>= -grad(p) + fvModels + D Us + buoyancy"]
 
-    D --> E["Begin solidification coupling loop<br/>corr = 1 ... 5"]
+    F --> G["Enter thermophysicalPredictor()<br/>Physical dt = OpenFOAM deltaT"]
 
-    E --> F["Freeze current phase-dependent coefficients<br/><br/>CpMix(fs)<br/>kEff(fs)<br/>dfsdT(fs,T,C)<br/><br/><b>EXPLICIT / LAGGED COEFFICIENTS</b>"]
+    G --> H["Checkpoint thermophysical fields at physical-step start<br/>T, Carbon, fs, CarbonL, CarbonS,<br/>interface/back-diffusion fields, CpMix, kEff,<br/>species coefficients, macrosegregation diagnostics"]
 
-    F --> G["Solve energy equation for T<br/><br/>ddt(CpMix,T)<br/>+ latent apparent-capacity term<br/>+ div(phi CpMix,T)<br/>- laplacian(kEff/rho,T) = 0<br/><br/><b>IMPLICIT:</b> T<br/><b>IMPLICIT:</b> latent Sp term in T<br/><b>EXPLICIT/FROZEN:</b> CpMix, kEff, dfsdT"]
+    H --> I["Set Nsub = 1<br/>dtThermo = dtPhysical / Nsub"]
 
-    G --> H["Update Lever equilibrium<br/><br/>Tliq(C)<br/>Tsol(C)<br/>fs(T,C)<br/>Cl(C,fs)<br/>Cs = kp Cl<br/>CpMix(fs)<br/>kEff(fs)<br/>dfsdT<br/><br/><b>EXPLICIT ALGEBRAIC UPDATE</b>"]
+    I --> J["Create local thermophysical old-state fields<br/>TsubOld, CsubOld, fssubOld, CpMixSubOld"]
 
-    H --> I["Freeze species coefficients<br/><br/>Dmix = fs Ds + (1-fs) Dl<br/>q = Cl/C = 1/[1+fs(kp-1)]<br/><br/><b>EXPLICIT / LAGGED COEFFICIENTS</b>"]
+    J --> K["Start thermophysical substep j = 1 ... Nsub<br/>Reset nonlinear relaxation factors<br/>omegaT, omegaC, omegaFs"]
 
-    I --> J["Solve mixture species equation for C<br/><br/>ddt(C)<br/>+ div(phi q,C)<br/>- laplacian(Dmix,C)<br/>= phase-difference diffusion corrections<br/><br/><b>IMPLICIT:</b> C storage<br/><b>IMPLICIT:</b> qC advection<br/><b>IMPLICIT:</b> mixture diffusion<br/><b>EXPLICIT:</b> phase-difference diffusion RHS"]
+    K --> L["Start nonlinear Picard correction k"]
 
-    J --> K["Recalculate Lever equilibrium<br/><br/>C changed → Tliq/Tsol change<br/>→ fs, Cl, Cs change<br/>→ CpMix, kEff, dfsdT change<br/><br/><b>EXPLICIT ALGEBRAIC UPDATE</b>"]
+    L --> M["Store iteration state<br/>T(k), C(k), fs(k)"]
 
-    K --> L{"corr < 5?"}
+    M --> N["Freeze current phase-dependent energy coefficients<br/>CpMix(fs), kEff(fs), latent linearisation,<br/>fully-liquid turbulent thermal switch"]
 
-    L -- Yes --> F
-    L -- No --> M["Final coupled T-C-phase state<br/>for this physical timestep"]
+    N --> O["Solve energy equation over dtThermo<br/>local transient history uses TsubOld/CpMixSubOld<br/>Implicit T + latent linearisation<br/>Apply omegaT nonlinear relaxation"]
 
-    %% =========================
-    %% PRESSURE CORRECTION
-    %% =========================
+    O --> P["Update phase + microsegregation closure after T solve<br/>Tliq/Tsol, fs, CarbonL, CarbonS,<br/>VB/Lever closure, CpMix, kEff, dfsdT, CpApp<br/>Apply omegaFs"]
 
-    M --> N["PISO pressure correction 1<br/><br/>Solve pressure equation<br/>correct phi and U<br/><br/><b>IMPLICIT pressure solve</b>"]
+    P --> Q["Update species coefficients<br/>DL_eff = DL + nut/Sct<br/>phase fractions/compositions frozen for this correction"]
 
-    N --> O["PISO pressure correction 2<br/><br/>Solve pressure equation<br/>correct phi and U<br/><br/><b>IMPLICIT pressure solve</b>"]
+    Q --> R["Solve mixture Carbon equation over dtThermo<br/>local transient history uses CsubOld<br/>bulk advection with U<br/>relative phase advection with U - Us<br/>selected diffusion linearisation<br/>Apply omegaC"]
 
-    O --> P["Post-solve diagnostics<br/><br/>BKC drag fields<br/>species diagnostics<br/>solute inventory<br/>macrosegregation"]
+    R --> S["Re-close phase + microsegregation after Carbon solve<br/>Carbon changes equilibrium -> fs, Cl, Cs, properties<br/>Apply omegaFs"]
 
-    P --> Q["Advance to next physical timestep"]
+    S --> T["Compute nonlinear changes<br/>dT  = max |T(k+1)-T(k)|<br/>dC  = max |C(k+1)-C(k)|<br/>dfs = max |fs(k+1)-fs(k)|"]
 
-    Q --> A
+    T --> U["Normalized coupling residual<br/>R = max(dT/Ttol, dC/Ctol, dfs/fstol)"]
+
+    U --> V{"Adaptive relaxation enabled<br/>and R stalled for required<br/>consecutive iterations?"}
+
+    V -- Yes --> W["Reduce all nonlinear relaxation factors<br/>omega <- max(omegaMin, reductionFactor * omega)<br/>Typical: 0.5 -> 0.25 -> 0.125"]
+    V -- No --> X{"Convergence mode?"}
+    W --> X
+
+    X -- "fixed" --> Y{"Reached nSolidificationLoops?"}
+    Y -- No --> L
+    Y -- Yes --> AA["Thermophysical substep accepted<br/>(legacy fixed-loop behavior)"]
+
+    X -- "converged" --> Z{"k >= minIterations<br/>AND dT <= Ttol<br/>AND dC <= Ctol<br/>AND dfs <= fstol ?"}
+
+    Z -- Yes --> AA
+    Z -- No --> AB{"k == maxSolidificationIterations?"}
+    AB -- No --> L
+    AB -- Yes --> AC["Substep FAILED<br/>Do not accept its thermophysical state"]
+
+    AA --> AD["Advance local thermophysical history only<br/>TsubOld <- T<br/>CsubOld <- Carbon<br/>fssubOld <- fs<br/>CpMixSubOld <- CpMix"]
+
+    AD --> AE{"More thermophysical<br/>substeps in this attempt?"}
+    AE -- Yes --> K
+    AE -- No --> AF["Attempt accepted<br/>Nsub substeps exactly cover dtPhysical"]
+
+    AC --> AG{"Can increase subcycling?<br/>thermophysicalSubcycling = true<br/>AND Nsub * factor <= maxNsub"}
+
+    AG -- Yes --> AH["Restore complete thermophysical checkpoint<br/>Nsub <- Nsub * thermophysicalSubcycleFactor<br/>dtThermo <- dtPhysical / Nsub"]
+    AH --> J
+
+    AG -- No --> AI["Restore thermophysical checkpoint<br/>FatalError<br/>FAILED physical thermophysical state is never accepted"]
+
+    AF --> AJ["pressureCorrector()<br/>PIMPLE pressure loop<br/>solve p, correct phi and U"]
+
+    AJ --> AK["Momentum-transport corrector<br/>viscosity->correct()<br/>momentumTransport->correct()"]
+
+    AK --> AL["postSolve()<br/>Refresh BKC drag and final diagnostics<br/>flow/Courant, species, phase, inventories,<br/>macrosegregation, requested diagnostics"]
+
+    AL --> AM["Physical step accepted<br/>write/output as requested<br/>advance to next OpenFOAM time step"]
+
+    AM --> A
+
+    classDef fail fill:#fff,stroke:#333,stroke-width:2px;
+    class AI fail;
